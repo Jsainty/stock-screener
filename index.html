@@ -352,7 +352,11 @@ function mockStock(sym) {
   const r = seedRng(sym + '2025');
   // UK base prices in pence
   const bases = {
-    AAPL:189,MSFT:415,GOOGL:176,AMZN:185,NVDA:875,META:505,TSLA:246,JPM:198,JNJ:152,V:276,NFLX:630,ADBE:490,
+    // US prices — approximate mid-2025 values (demo only; live prices come from API)
+    AAPL:213,MSFT:452,GOOGL:178,AMZN:202,NVDA:135,META:612,TSLA:248,JPM:236,JNJ:161,V:295,
+    NFLX:720,ADBE:420,'BRK-B':468,UNH:590,MA:530,HD:392,CVX:158,MRK:98,ABBV:192,PEP:153,
+    KO:71,AVGO:185,COST:930,LLY:825,TMO:498,MCD:293,DIS:118,ACN:328,DHR:225,NEE:74,
+    IBM:238,CRM:296,AMD:142,INTC:22,QCOM:185,TXN:192,AMAT:195,ORCL:148,PYPL:75,PG:168,
     'SHEL.L':2780,'AZN.L':10540,'HSBA.L':695,'ULVR.L':3820,'BP.L':453,'RIO.L':5180,'GSK.L':1695,
     'LSEG.L':9480,'REL.L':3410,'DGE.L':2290,'LLOY.L':55,'BARC.L':228,'NG.L':948,'BA.L':1248,
     'RR.L':498,'TSCO.L':362,'STAN.L':847,'NWG.L':378,'PRU.L':752,'III.L':2980,'IMB.L':2490,
@@ -758,21 +762,40 @@ function renderScreener(main) {
   const rows = data.map(s => {
     const up = s.changePercent >= 0;
     const {overall,valuation,profitability,growth,health} = s.scores;
-    const displaySym = s.market==='UK' ? s.symbol.replace('.L','') : s.symbol;
-    const mktBadge   = s.market==='UK'
+    const displaySym  = s.market==='UK' ? s.symbol.replace('.L','') : s.symbol;
+    const hasFullData = !!s._liveFundamentals || !state.apiKey; // full data loaded
+    const mktBadge    = s.market==='UK'
       ? `<span class="badge badge-blue" style="font-size:9px;margin-left:4px">${UK_INDEX_MAP[s.symbol]||'LSE'}</span>`
       : `<span class="badge" style="font-size:9px;margin-left:4px;background:rgba(16,185,129,.1);color:#10b981">NYSE/NDQ</span>`;
-    function scoreCell(v){ return `<td><div style="display:flex;align-items:center;gap:6px"><span style="color:${scoreColor(v)};font-weight:600;font-size:12px;min-width:24px">${v}</span>${barHTML(v,scoreColor(v))}</div></td>`; }
+
+    // Score cell — greyed out with '?' if fundamentals not yet loaded for this stock
+    function scoreCell(v, needsFund=true) {
+      if (needsFund && !hasFullData) {
+        return `<td><div style="display:flex;align-items:center;gap:6px;opacity:.35">
+          <span style="color:#64748b;font-size:12px;min-width:24px">—</span>
+          ${barHTML(50,'#2d3148')}
+        </div></td>`;
+      }
+      return `<td><div style="display:flex;align-items:center;gap:6px">
+        <span style="color:${scoreColor(v)};font-weight:600;font-size:12px;min-width:24px">${v}</span>
+        ${barHTML(v,scoreColor(v))}
+      </div></td>`;
+    }
+
+    const overallBadge = hasFullData
+      ? `<span class="badge ${scoreBadge(overall)}" style="font-size:13px;padding:3px 10px">${overall}</span>`
+      : `<span class="badge badge-yellow" style="font-size:11px;padding:3px 10px" title="Click Analyse for full score">P/E only</span>`;
+
     return `<tr onclick="analyzeStock('${s.symbol}')" style="cursor:pointer">
       <td class="sym">${displaySym}${mktBadge}</td>
-      <td style="color:#94a3b8;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.name}</td>
+      <td style="color:#94a3b8;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.name||'—'}</td>
       <td>${fP(s.price,s.symbol)}</td>
       <td class="${up?'up':'down'}">${up?'+':''}${fPct(s.changePercent)}</td>
       <td style="color:#94a3b8">${fBig(s.marketCap,s.symbol)}</td>
       <td style="color:#94a3b8">${s.pe?s.pe.toFixed(1)+'x':'N/A'}</td>
       <td><span class="badge badge-blue" style="font-size:10px">${(s.sector||'—').split(' ')[0]}</span></td>
       ${scoreCell(valuation)}${scoreCell(profitability)}${scoreCell(growth)}${scoreCell(health)}
-      <td><span class="badge ${scoreBadge(overall)}" style="font-size:13px;padding:3px 10px">${overall}</span></td>
+      <td>${overallBadge}</td>
       <td><button class="btn-sm" onclick="event.stopPropagation();analyzeStock('${s.symbol}')">Analyse →</button></td>
     </tr>`;
   }).join('');
@@ -1213,7 +1236,60 @@ async function fetchBatchQuotes(symbols) {
   } catch(e) { console.warn('Batch quote fetch failed:', e.message); return []; }
 }
 
-// Fundamentals with 10-min cache so repeated analysis visits don't burn quota
+// Build a clean stock entry from a live quote — NO mock fundamentals injected
+function quoteToMarketEntry(q) {
+  const sym = q.symbol;
+  return {
+    symbol: sym,
+    name: q.name || sym,
+    price: q.price,
+    change: q.change,
+    changePercent: q.changesPercentage,
+    marketCap: q.marketCap,
+    volume: q.volume,
+    pe: q.pe || null,
+    eps: q.eps || null,
+    week52High: q.yearHigh || null,
+    week52Low: q.yearLow || null,
+    exchange: q.exchange || (isUK(sym) ? UK_INDEX_MAP[sym]||'LSE' : ''),
+    market: isUK(sym) ? 'UK' : 'US',
+    // Enriched by batch profile (added separately)
+    sector: null, industry: null, description: null,
+    employees: null, beta: null, dividendYield: null,
+    // Ratios only available after individual stock analysis
+    pb: null, ps: null, roe: null, roa: null,
+    debtToEquity: null, currentRatio: null, quickRatio: null,
+    grossMargin: null, operatingMargin: null, netMargin: null,
+    evToEbitda: null, pfcf: null, interestCoverage: null,
+    freeCashFlow: null, revenueGrowth: null, earningsGrowth: null,
+    _livePrice: true,
+  };
+}
+
+// Batch-fetch profiles for many symbols in one API call to get sector/name/beta/dividend
+async function fetchBatchProfiles(symbols) {
+  try {
+    const data = await apiFetch(`/profile/${symbols.join(',')}`);
+    if (!Array.isArray(data)) return {};
+    const map = {};
+    data.forEach(p => {
+      if (p.symbol) map[p.symbol] = {
+        sector: p.sector || null,
+        industry: p.industry || null,
+        description: p.description || null,
+        employees: p.fullTimeEmployees || null,
+        beta: p.beta || null,
+        // dividendYield from profile is annual dividend amount, not %. Calculate below.
+        _lastDiv: p.lastDiv || 0,
+        exchange: p.exchangeShortName || null,
+        name: p.companyName || null,
+      };
+    });
+    return map;
+  } catch(e) { console.warn('Batch profile fetch failed:', e.message); return {}; }
+}
+
+// Fundamentals with 10-min cache — called only when a stock is individually opened
 async function fetchFundamentals(sym) {
   const cached = state.fundCache[sym];
   if (cached && Date.now() - cached.ts < FUND_CACHE_MS) return cached.data;
@@ -1223,29 +1299,46 @@ async function fetchFundamentals(sym) {
       apiFetch(`/ratios-ttm/${sym}`),
       apiFetch(`/financial-growth/${sym}?limit=1`),
     ]);
-    const p = profileArr?.[0] || {};
-    const rat = ratiosArr?.[0] || {};
-    const gr = growthArr?.[0] || {};
+    const p   = profileArr?.[0] || {};
+    const rat = ratiosArr?.[0]  || {};
+    const gr  = growthArr?.[0]  || {};
+
+    // FMP returns ROE/ROA/margins as decimals (0.43 = 43%) — multiply by 100
+    // BUT some values can be >1 legitimately (e.g. Apple ROE ~1.5 = 150%)
+    function pct(v) { return v != null ? v * 100 : null; }
+    // Interest coverage is already a ratio (e.g. 30.5), not a decimal
+    // EV/EBITDA and P/B/P/S ratios are already in ratio form, no multiplier needed
+
+    // dividendYield: use dividendYieldTTM from ratios (decimal → %) not lastDiv (amount)
+    const divYield = rat.dividendYieldTTM != null
+      ? rat.dividendYieldTTM * 100
+      : (p.lastDiv && p.price ? (p.lastDiv / p.price) * 100 : null);
+
     const data = {
-      sector: p.sector, industry: p.industry, description: p.description,
-      employees: p.fullTimeEmployees, beta: p.beta, dividendYield: p.lastDiv,
-      exchange: p.exchangeShortName,
-      pb: rat.priceToBookRatioTTM,
-      ps: rat.priceToSalesRatioTTM,
-      roe: rat.returnOnEquityTTM != null ? rat.returnOnEquityTTM * 100 : null,
-      roa: rat.returnOnAssetsTTM != null ? rat.returnOnAssetsTTM * 100 : null,
-      debtToEquity: rat.debtEquityRatioTTM,
-      currentRatio: rat.currentRatioTTM,
-      quickRatio: rat.quickRatioTTM,
-      grossMargin:      rat.grossProfitMarginTTM      != null ? rat.grossProfitMarginTTM * 100 : null,
-      operatingMargin:  rat.operatingProfitMarginTTM  != null ? rat.operatingProfitMarginTTM * 100 : null,
-      netMargin:        rat.netProfitMarginTTM         != null ? rat.netProfitMarginTTM * 100 : null,
-      evToEbitda: rat.enterpriseValueMultipleTTM,
-      pfcf: rat.priceToFreeCashFlowsRatioTTM,
-      interestCoverage: rat.interestCoverageTTM,
-      freeCashFlow: rat.freeCashFlowPerShareTTM,
-      revenueGrowth:  gr.revenueGrowth  != null ? gr.revenueGrowth * 100  : null,
-      earningsGrowth: gr.netIncomeGrowth != null ? gr.netIncomeGrowth * 100 : null,
+      sector: p.sector || null,
+      industry: p.industry || null,
+      description: p.description || null,
+      employees: p.fullTimeEmployees || null,
+      beta: p.beta || null,
+      exchange: p.exchangeShortName || null,
+      dividendYield: divYield,
+      pb:              rat.priceToBookRatioTTM       ?? null,
+      ps:              rat.priceToSalesRatioTTM      ?? null,
+      roe:             pct(rat.returnOnEquityTTM),
+      roa:             pct(rat.returnOnAssetsTTM),
+      debtToEquity:    rat.debtEquityRatioTTM        ?? null,
+      currentRatio:    rat.currentRatioTTM           ?? null,
+      quickRatio:      rat.quickRatioTTM             ?? null,
+      grossMargin:     pct(rat.grossProfitMarginTTM),
+      operatingMargin: pct(rat.operatingProfitMarginTTM),
+      netMargin:       pct(rat.netProfitMarginTTM),
+      evToEbitda:      rat.enterpriseValueMultipleTTM ?? null,
+      pfcf:            rat.priceToFreeCashFlowsRatioTTM ?? null,
+      interestCoverage: rat.interestCoverageTTM      ?? null,
+      // freeCashFlowPerShareTTM is per-share — store separately, don't show as total
+      freeCashFlow:    null,
+      revenueGrowth:   pct(gr.revenueGrowth),
+      earningsGrowth:  pct(gr.netIncomeGrowth),
     };
     state.fundCache[sym] = { data, ts: Date.now() };
     return data;
@@ -1369,6 +1462,25 @@ function startClock() {
   }, 5000);
 }
 
+// Only the 7 fields that change tick-by-tick — never touches fundamentals
+function applyQuotePatch(existing, q) {
+  if (!q) return existing;
+  const prev = existing.price;
+  return {
+    ...existing,
+    price:         q.price,
+    change:        q.change,
+    changePercent: q.changesPercentage,
+    volume:        q.volume,
+    marketCap:     q.marketCap,
+    pe:            q.pe    ?? existing.pe,
+    eps:           q.eps   ?? existing.eps,
+    week52High:    q.yearHigh ?? existing.week52High,
+    week52Low:     q.yearLow  ?? existing.week52Low,
+    _flash: q.price > prev ? 'up' : q.price < prev ? 'down' : null,
+  };
+}
+
 async function refreshAllPrices() {
   if (!state.apiKey) return;
   try {
@@ -1376,40 +1488,19 @@ async function refreshAllPrices() {
     if (!quotes.length) return;
     state.lastRefresh = Date.now();
 
-    // Build a quick lookup map
     const map = {};
-    quotes.forEach(q => { map[q.symbol] = q; });
+    quotes.forEach(q => { if (q.symbol) map[q.symbol] = q; });
 
-    // Update market data — track previous price for flash
-    state.marketData = state.marketData.map(s => {
-      const q = map[s.symbol];
-      if (!q) return s;
-      const prevPrice = s.price;
-      return { ...s, price: q.price, change: q.change, changePercent: q.changesPercentage,
-               volume: q.volume, marketCap: q.marketCap,
-               _flash: q.price > prevPrice ? 'up' : q.price < prevPrice ? 'down' : null };
-    });
+    // Patch price fields only — fundamentals already loaded stay intact
+    state.marketData  = state.marketData.map(s  => applyQuotePatch(s, map[s.symbol]));
+    state.screenerData = state.screenerData.map(s => applyQuotePatch(s, map[s.symbol]));
 
-    // Update screener data
-    state.screenerData = state.screenerData.map(s => {
-      const q = map[s.symbol];
-      if (!q) return s;
-      return { ...s, price: q.price, change: q.change, changePercent: q.changesPercentage,
-               volume: q.volume, marketCap: q.marketCap };
-    });
-
-    // Update open analysis stock price in-place (no full reload)
     if (state.selectedStock && map[state.selectedStock.symbol]) {
-      const q = map[state.selectedStock.symbol];
-      const prevPrice = state.selectedStock.price;
-      state.selectedStock = { ...state.selectedStock, price: q.price, change: q.change,
-                               changePercent: q.changesPercentage, volume: q.volume,
-                               _flash: q.price > prevPrice ? 'up' : q.price < prevPrice ? 'down' : null };
+      state.selectedStock = applyQuotePatch(state.selectedStock, map[state.selectedStock.symbol]);
     }
 
     updatePricesInDOM(map);
     updateLastUpdatedText();
-    console.log(`[AutoRefresh] Prices updated at ${new Date().toLocaleTimeString()}`);
   } catch(e) { console.warn('refreshAllPrices failed:', e.message); }
 }
 
@@ -1609,20 +1700,18 @@ window.analyzeStock = async function(sym) {
 
   let d;
   if (quote) {
+    // Start from a clean quote entry, then layer in real fundamentals
     d = {
-      symbol:        quote.symbol,
-      name:          quote.name,
-      price:         quote.price,
-      change:        quote.change,
-      changePercent: quote.changesPercentage,
-      marketCap:     quote.marketCap,
-      volume:        quote.volume,
-      pe:            quote.pe,
-      eps:           quote.eps,
-      week52High:    quote.yearHigh,
-      week52Low:     quote.yearLow,
-      exchange:      quote.exchange,
+      ...quoteToMarketEntry(quote),
       ...fundamentals,
+      // quote fields take priority over fundamentals for price/market data
+      price: quote.price, change: quote.change, changePercent: quote.changesPercentage,
+      marketCap: quote.marketCap, volume: quote.volume,
+      pe: quote.pe, eps: quote.eps,
+      week52High: quote.yearHigh, week52Low: quote.yearLow,
+      exchange: fundamentals.exchange || quote.exchange,
+      name: fundamentals.name || quote.name || sym,
+      _livePrice: true, _liveFundamentals: true,
     };
   } else {
     d = mockStock(sym);
@@ -1630,6 +1719,13 @@ window.analyzeStock = async function(sym) {
 
   const {scores, details} = score(d);
   state.selectedStock = {...d, scores, details};
+
+  // Write fundamentals back into marketData/screenerData so screener scores improve
+  if (d._liveFundamentals) {
+    const update = s => s.symbol === sym ? {...s, ...d, scores} : s;
+    state.marketData   = state.marketData.map(update);
+    state.screenerData = state.screenerData.map(update);
+  }
 
   // Fetch price history
   let hist = null;
@@ -1728,42 +1824,70 @@ window.setChartRange = async function(days) {
   setTimeout(()=>renderPriceChart(state.selectedHistory), 50);
 };
 
+// Shared helper — build market data from live quotes + profiles, no mock fundamentals
+async function loadLiveMarketData(showToasts = false) {
+  if (showToasts) showToast('Fetching live prices and profiles…', 'info');
+
+  const [quotes, profiles] = await Promise.all([
+    fetchBatchQuotes(ALL_SYMBOLS),
+    fetchBatchProfiles(ALL_SYMBOLS),
+  ]);
+
+  if (!quotes.length) {
+    if (showToasts) showToast('Could not reach FMP — check your API key', 'error');
+    return false;
+  }
+
+  const quoteMap = {};
+  quotes.forEach(q => { if (q.symbol) quoteMap[q.symbol] = q; });
+
+  state.marketData = ALL_SYMBOLS
+    .filter(sym => quoteMap[sym])          // only symbols FMP returned data for
+    .map(sym => {
+      const entry   = quoteToMarketEntry(quoteMap[sym]);
+      const profile = profiles[sym] || {};
+
+      // Merge profile data (sector, description, beta, dividendYield)
+      entry.sector      = profile.sector      || null;
+      entry.industry    = profile.industry    || null;
+      entry.description = profile.description || null;
+      entry.employees   = profile.employees   || null;
+      entry.beta        = profile.beta        || null;
+      entry.name        = profile.name || entry.name;
+      // dividendYield from profile: lastDiv is per-share amount, convert to yield %
+      if (profile._lastDiv && entry.price) {
+        entry.dividendYield = (profile._lastDiv / entry.price) * 100;
+      }
+      if (entry.exchange === '' && profile.exchange) entry.exchange = profile.exchange;
+
+      const { scores } = score(entry);
+      entry.scores = scores;
+      return entry;
+    });
+
+  // Symbols FMP didn't return (delisted, invalid) — exclude silently
+  state.screenerData  = [...state.marketData];
+  state.lastRefresh   = Date.now();
+
+  if (showToasts) showToast(`Live data loaded for ${state.marketData.length} stocks ✓`, 'success');
+  return true;
+}
+
 window.saveApiKey = async function() {
   state.apiKey = document.getElementById('apiKeyInput').value.trim();
   localStorage.setItem('fmp_key', state.apiKey);
+  // Invalidate all caches when key changes
+  state.fundCache  = {};
+  state.newsCache  = {};
+  state._newsCached = null;
   updateDataModeLabel();
 
   if (state.apiKey) {
-    showToast('API key saved — fetching live data…', 'info');
-    // Load initial batch of prices for overview + screener
-    const quotes = await fetchBatchQuotes(ALL_SYMBOLS);
-    if (quotes.length) {
-      const map = {};
-      quotes.forEach(q => { map[q.symbol] = q; });
-      state.marketData = ALL_SYMBOLS.map(sym => {
-        const q = map[sym] || {};
-        const base = mockStock(sym);
-        const merged = { ...base,
-          price: q.price ?? base.price, change: q.change ?? base.change,
-          changePercent: q.changesPercentage ?? base.changePercent,
-          marketCap: q.marketCap ?? base.marketCap, volume: q.volume ?? base.volume,
-          pe: q.pe ?? base.pe, eps: q.eps ?? base.eps,
-          week52High: q.yearHigh ?? base.week52High, week52Low: q.yearLow ?? base.week52Low,
-          name: q.name ?? base.name, exchange: q.exchange ?? base.exchange,
-        };
-        const {scores} = score(merged);
-        return {...merged, scores};
-      });
-      state.screenerData = [...state.marketData];
-      state.lastRefresh = Date.now();
-      showToast(`Live prices loaded for ${quotes.length} stocks ✓`, 'success');
-    } else {
-      showToast('API key may be invalid — check and try again', 'error');
-    }
+    await loadLiveMarketData(true);
     startPriceRefresh();
   } else {
     stopPriceRefresh();
-    state.marketData = [];
+    state.marketData  = [];
     state.screenerData = [];
   }
 
@@ -1848,32 +1972,10 @@ updateMarketStatus();
 startClock();
 
 if (state.apiKey) {
-  // Silently pre-load all prices on page open so Overview is live immediately
   (async () => {
-    const quotes = await fetchBatchQuotes(ALL_SYMBOLS);
-    if (quotes.length) {
-      const map = {};
-      quotes.forEach(q => { map[q.symbol] = q; });
-      state.marketData = ALL_SYMBOLS.map(sym => {
-        const q = map[sym] || {};
-        const base = mockStock(sym);
-        const merged = {
-          ...base,
-          price: q.price ?? base.price, change: q.change ?? base.change,
-          changePercent: q.changesPercentage ?? base.changePercent,
-          marketCap: q.marketCap ?? base.marketCap, volume: q.volume ?? base.volume,
-          pe: q.pe ?? base.pe, eps: q.eps ?? base.eps,
-          week52High: q.yearHigh ?? base.week52High, week52Low: q.yearLow ?? base.week52Low,
-          name: q.name ?? base.name, exchange: q.exchange ?? base.exchange,
-        };
-        const {scores} = score(merged);
-        return {...merged, scores};
-      });
-      state.screenerData = [...state.marketData];
-      state.lastRefresh = Date.now();
-      render();
-      updateLastUpdatedText();
-    }
+    await loadLiveMarketData(false);
+    render();
+    updateLastUpdatedText();
   })();
   startPriceRefresh();
 }
