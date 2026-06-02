@@ -164,6 +164,36 @@ select:focus,input[type=text]:focus{border-color:#6366f1}
 .field-note{font-size:12px;color:#64748b;margin-top:5px}
 .status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
 @keyframes slideIn{from{transform:translateX(40px);opacity:0}to{transform:translateX(0);opacity:1}}
+/* News */
+.news-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:16px}
+.news-card{background:#1a1d27;border:1px solid #2d3148;border-radius:12px;overflow:hidden;display:flex;flex-direction:column;transition:border-color .15s,transform .15s;cursor:pointer}
+.news-card:hover{border-color:#6366f1;transform:translateY(-2px)}
+.news-card-img{width:100%;height:160px;object-fit:cover;background:#12151f;display:block}
+.news-card-img-placeholder{width:100%;height:160px;background:linear-gradient(135deg,#1e2235,#12151f);display:flex;align-items:center;justify-content:center;font-size:36px}
+.news-card-body{padding:14px;flex:1;display:flex;flex-direction:column;gap:8px}
+.news-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.news-source{font-size:11px;font-weight:700;color:#6366f1;text-transform:uppercase;letter-spacing:.04em}
+.news-time{font-size:11px;color:#64748b}
+.news-title{font-size:14px;font-weight:600;color:#e2e8f0;line-height:1.45;text-decoration:none;display:block}
+.news-title:hover{color:#818cf8}
+.news-snippet{font-size:12px;color:#64748b;line-height:1.55;flex:1}
+.news-footer{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:4px}
+.news-ticker{background:rgba(99,102,241,.15);color:#818cf8;font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;font-family:monospace}
+.news-ticker-uk{background:rgba(16,185,129,.1);color:#10b981}
+.news-read{margin-left:auto;font-size:11px;color:#64748b;white-space:nowrap}
+.news-hero{grid-column:1/-1;display:flex;gap:0;border-radius:12px;overflow:hidden;border:1px solid #2d3148;background:#1a1d27;cursor:pointer;transition:border-color .15s}
+.news-hero:hover{border-color:#6366f1}
+.news-hero-img{width:420px;flex-shrink:0;object-fit:cover;background:#12151f;min-height:220px}
+.news-hero-body{padding:20px;display:flex;flex-direction:column;gap:10px;justify-content:center}
+.news-hero-title{font-size:18px;font-weight:700;color:#e2e8f0;line-height:1.4;text-decoration:none}
+.news-hero-title:hover{color:#818cf8}
+.news-hero-snippet{font-size:13px;color:#94a3b8;line-height:1.6}
+.news-filter-bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:20px}
+.news-empty{text-align:center;padding:60px 20px;color:#64748b}
+.skeleton{background:linear-gradient(90deg,#1a1d27 25%,#1e2235 50%,#1a1d27 75%);background-size:200% 100%;animation:shimmer 1.4s infinite;border-radius:6px}
+@keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+.source-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600}
+@media(max-width:700px){.news-hero{flex-direction:column}.news-hero-img{width:100%;height:180px}}
 @keyframes flashUp{0%{background:rgba(16,185,129,.3)}100%{background:transparent}}
 @keyframes flashDown{0%{background:rgba(239,68,68,.3)}100%{background:transparent}}
 .flash-up{animation:flashUp .8s ease}
@@ -195,6 +225,7 @@ select:focus,input[type=text]:focus{border-color:#6366f1}
     <nav>
       <button class="nav-btn active" data-tab="overview">Overview</button>
       <button class="nav-btn" data-tab="screener">Screener</button>
+      <button class="nav-btn" data-tab="news">News</button>
       <button class="nav-btn" data-tab="watchlist">Watchlist</button>
       <button class="nav-btn" data-tab="settings">Settings</button>
       <button class="nav-btn" data-tab="analysis" id="analysisTab" style="display:none">
@@ -221,6 +252,7 @@ const FMP = 'https://financialmodelingprep.com/api/v3';
 const PRICE_REFRESH_MS    = 60_000;   // refresh all prices every 60 s
 const ANALYSIS_REFRESH_MS = 30_000;   // refresh open stock quote every 30 s
 const FUND_CACHE_MS       = 600_000;  // cache fundamentals for 10 min
+const NEWS_CACHE_MS       = 300_000;  // cache news for 5 min
 // US symbols
 const US_SYMBOLS = ['AAPL','MSFT','GOOGL','AMZN','NVDA','META','TSLA','BRK-B','JPM','JNJ',
   'V','PG','UNH','MA','HD','CVX','MRK','ABBV','PEP','KO',
@@ -284,6 +316,11 @@ const state = {
   lastRefresh: null,
   // fundamentals cache: { [symbol]: { data, ts } }
   fundCache: {},
+  // news cache: { [key]: { data, ts } }
+  newsCache: {},
+  newsFilter: 'all',   // 'all' | 'us' | 'uk' | 'watchlist'
+  newsTimer: null,
+  newsLastRefresh: null,
 };
 
 // ─── MOCK DATA ────────────────────────────────────────────────────────────────
@@ -562,11 +599,12 @@ function setAnalysisTab(tab) {
 // ─── RENDER ROOT ─────────────────────────────────────────────────────────────
 function render() {
   const main = document.getElementById('main');
-  if(state.tab==='overview') renderOverview(main);
-  else if(state.tab==='screener') renderScreener(main);
+  if(state.tab==='overview')  renderOverview(main);
+  else if(state.tab==='screener')  renderScreener(main);
+  else if(state.tab==='news')      { renderNews(main, state._newsCached || MOCK_NEWS); loadAndRenderNews(); }
   else if(state.tab==='watchlist') renderWatchlist(main);
-  else if(state.tab==='settings') renderSettings(main);
-  else if(state.tab==='analysis') renderAnalysis(main);
+  else if(state.tab==='settings')  renderSettings(main);
+  else if(state.tab==='analysis')  renderAnalysis(main);
 }
 
 // ─── OVERVIEW ────────────────────────────────────────────────────────────────
@@ -806,6 +844,110 @@ function renderWatchlist(main) {
     <div class="grid4">${cards}</div>`;
 }
 
+// ─── NEWS RENDER ─────────────────────────────────────────────────────────────
+function renderNews(main, articles) {
+  const f = state.newsFilter;
+  const isDemo = !state.apiKey;
+
+  const filterBtns = [
+    ['all','📰 All News'], ['us','🇺🇸 US Markets'], ['uk','🇬🇧 UK Markets'], ['watchlist','⭐ Watchlist'],
+  ].map(([v,l]) => `<button onclick="setNewsFilter('${v}')" class="tab-btn ${f===v?'active':''}" style="font-size:12px;padding:5px 14px">${l}</button>`).join('');
+
+  const ago = state.newsLastRefresh ? timeAgo(new Date(state.newsLastRefresh).toISOString()) : null;
+
+  function articleCard(a, hero=false) {
+    const col   = sourceColor(a.site);
+    const sym   = a.symbol || '';
+    const syms  = sym.split(',').map(s=>s.trim()).filter(Boolean);
+    const tickers = syms.map(s => {
+      const uk = s.endsWith('.L');
+      return `<span class="news-ticker ${uk?'news-ticker-uk':''}">${s.replace('.L','')}</span>`;
+    }).join('');
+    const imgEl = a.image
+      ? `<img class="${hero?'news-hero-img':'news-card-img'}" src="${a.image}" loading="lazy" onerror="this.style.display='none'">`
+      : `<div class="${hero?'news-hero-img':'news-card-img-placeholder'}">📰</div>`;
+
+    if (hero) return `
+      <a class="news-hero" href="${a.url!=='#'?a.url:'javascript:void(0)'}" target="${a.url!=='#'?'_blank':'_self'}" rel="noopener noreferrer">
+        ${imgEl}
+        <div class="news-hero-body">
+          <div class="news-meta">
+            <span class="news-source" style="color:${col}">${a.site}</span>
+            <span class="news-time">${timeAgo(a.publishedDate)}</span>
+          </div>
+          <span class="news-hero-title">${a.title}</span>
+          <p class="news-hero-snippet">${(a.text||'').slice(0,200)}${a.text?.length>200?'…':''}</p>
+          <div class="news-footer">${tickers}<span class="news-read">Read full article →</span></div>
+        </div>
+      </a>`;
+
+    return `
+      <a class="news-card" href="${a.url!=='#'?a.url:'javascript:void(0)'}" target="${a.url!=='#'?'_blank':'_self'}" rel="noopener noreferrer">
+        ${imgEl}
+        <div class="news-card-body">
+          <div class="news-meta">
+            <span class="news-source" style="color:${col}">${a.site}</span>
+            <span class="news-time">${timeAgo(a.publishedDate)}</span>
+          </div>
+          <span class="news-title">${a.title}</span>
+          <p class="news-snippet">${(a.text||'').slice(0,130)}${(a.text||'').length>130?'…':''}</p>
+          <div class="news-footer">${tickers}<span class="news-read">Read →</span></div>
+        </div>
+      </a>`;
+  }
+
+  const hero   = articles[0];
+  const rest   = articles.slice(1);
+
+  // Source breakdown bar
+  const srcCount = {};
+  articles.forEach(a => { srcCount[a.site] = (srcCount[a.site]||0)+1; });
+  const srcBadges = Object.entries(srcCount).sort((a,b)=>b[1]-a[1]).slice(0,6).map(([src,n]) =>
+    `<span class="source-badge" style="background:${sourceColor(src)}22;color:${sourceColor(src)}">${src} <span style="opacity:.7">${n}</span></span>`
+  ).join('');
+
+  main.innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:16px">
+      <div>
+        <span style="font-size:20px;font-weight:700">Market News</span>
+        ${isDemo ? `<span style="font-size:12px;color:#f59e0b;margin-left:10px">Demo headlines — add API key for live news</span>` : `<span style="font-size:12px;color:#64748b;margin-left:10px">Refreshes every 5 min</span>`}
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        ${ago ? `<span style="font-size:11px;color:#64748b">Updated ${ago}</span>` : ''}
+        <button class="refresh-btn" onclick="refreshNews()">↻ Refresh</button>
+      </div>
+    </div>
+
+    <div class="news-filter-bar">${filterBtns}</div>
+
+    ${srcBadges ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px;align-items:center">
+      <span style="font-size:11px;color:#64748b;margin-right:2px">Sources:</span>${srcBadges}
+    </div>` : ''}
+
+    ${!articles.length ? `<div class="news-empty"><div style="font-size:40px;margin-bottom:12px">📰</div><div style="font-size:16px;font-weight:600;margin-bottom:6px">No articles found</div><div>Try a different filter or check your API key in Settings</div></div>` : `
+    <div class="news-grid">
+      ${hero ? articleCard(hero, true) : ''}
+      ${rest.map(a => articleCard(a)).join('')}
+    </div>`}`;
+}
+
+function stockNewsHTML(articles) {
+  if (!articles?.length) return `<div style="color:#64748b;font-size:13px;padding:20px 0;text-align:center">No recent news found for this stock.</div>`;
+  return `<div style="display:flex;flex-direction:column;gap:12px">` + articles.slice(0,8).map(a => {
+    const col = sourceColor(a.site);
+    return `<a class="news-card" href="${a.url!=='#'?a.url:'javascript:void(0)'}" target="${a.url!=='#'?'_blank':'_self'}" rel="noopener noreferrer" style="display:flex;gap:12px;padding:14px;text-decoration:none">
+      <div style="flex:1">
+        <div class="news-meta" style="margin-bottom:5px">
+          <span class="news-source" style="color:${col}">${a.site}</span>
+          <span class="news-time">&nbsp;·&nbsp;${timeAgo(a.publishedDate)}</span>
+        </div>
+        <div class="news-title" style="font-size:13px">${a.title}</div>
+        <div class="news-snippet" style="margin-top:4px">${(a.text||'').slice(0,120)}${(a.text||'').length>120?'…':''}</div>
+      </div>
+    </a>`;
+  }).join('') + `</div>`;
+}
+
 // ─── SETTINGS ─────────────────────────────────────────────────────────────────
 function renderSettings(main) {
   const hasKey=!!state.apiKey;
@@ -860,13 +1002,17 @@ function renderAnalysis(container) {
   const inWL=state.watchlist.includes(s.symbol);
   const up=s.changePercent>=0;
 
-  const tabBtns=['overview','chart','fundamentals','strengths'].map(id=>`<button class="tab-btn ${state.analysisTab===id?'active':''}" onclick="setAnalysisTab('${id}')">${id==='strengths'?'Strengths & Weaknesses':id.charAt(0).toUpperCase()+id.slice(1)}</button>`).join('');
+  const tabBtns=[
+    ['overview','Overview'],['chart','Price Chart'],['fundamentals','Fundamentals'],
+    ['strengths','Strengths & Weaknesses'],['news','News'],
+  ].map(([id,label])=>`<button class="tab-btn ${state.analysisTab===id?'active':''}" onclick="setAnalysisTab('${id}')">${label}</button>`).join('');
 
   let subHTML='';
   if(state.analysisTab==='overview') subHTML=renderAnalysisOverview(s);
   else if(state.analysisTab==='chart') subHTML=renderAnalysisChart(s);
   else if(state.analysisTab==='fundamentals') subHTML=renderAnalysisFundamentals(s);
   else if(state.analysisTab==='strengths') subHTML=renderAnalysisStrengths(s);
+  else if(state.analysisTab==='news') subHTML=`<div id="stockNewsContainer"><div class="loading-wrap" style="padding:40px 0"><div class="spinner"></div><div style="font-size:13px;color:#64748b">Loading news for ${s.symbol.replace('.L','')}…</div></div></div>`;
 
   main.innerHTML=`
     <!-- Header -->
@@ -1005,6 +1151,52 @@ function renderAnalysisStrengths(s) {
   </div>`;
 }
 
+// ─── MOCK NEWS ───────────────────────────────────────────────────────────────
+const MOCK_NEWS = [
+  { title:'Federal Reserve holds rates steady amid mixed economic signals', site:'Reuters', publishedDate: new Date(Date.now()-3600000).toISOString(), text:'The Federal Reserve kept its benchmark interest rate unchanged, citing persistent inflation pressures balanced against signs of a slowing labour market. Chair Powell noted the committee remains data-dependent.', url:'#', symbol:'SPY', image:null },
+  { title:'NVIDIA reports record quarterly revenue driven by AI chip demand', site:'Yahoo Finance', publishedDate: new Date(Date.now()-7200000).toISOString(), text:'NVIDIA posted $26bn in quarterly revenue, surpassing analyst expectations by 12%. Data centre sales grew 427% year-on-year as hyperscalers continued to ramp AI infrastructure spending.', url:'#', symbol:'NVDA', image:null },
+  { title:'Shell announces $3.5bn share buyback as energy profits remain elevated', site:'Financial Times', publishedDate: new Date(Date.now()-10800000).toISOString(), text:'Shell plc confirmed a new $3.5 billion share buyback programme following strong Q2 results. The oil major cited robust LNG margins and improved refining performance as key drivers.', url:'#', symbol:'SHEL.L', image:null },
+  { title:'AstraZeneca cancer drug receives FDA breakthrough therapy designation', site:'MarketWatch', publishedDate: new Date(Date.now()-14400000).toISOString(), text:'AstraZeneca\'s oncology pipeline received a significant boost after the FDA granted breakthrough therapy designation to its lead lung cancer treatment, potentially accelerating approval timelines.', url:'#', symbol:'AZN.L', image:null },
+  { title:'Apple Vision Pro sales disappoint; company shifts focus to lower-cost model', site:'Bloomberg', publishedDate: new Date(Date.now()-18000000).toISOString(), text:'Apple is reportedly accelerating development of a more affordable mixed-reality headset after Vision Pro sales came in below internal projections. Analysts expect a sub-$1,500 model by 2026.', url:'#', symbol:'AAPL', image:null },
+  { title:'HSBC completes Asia spin-off review, rules out structural break-up', site:'BBC Business', publishedDate: new Date(Date.now()-21600000).toISOString(), text:'HSBC Holdings concluded its strategic review and confirmed it will not separate its Asian operations, a move that disappointed activist shareholders who had pushed for a break-up to unlock value.', url:'#', symbol:'HSBA.L', image:null },
+  { title:'Microsoft Azure growth accelerates to 31% on AI workload expansion', site:'CNBC', publishedDate: new Date(Date.now()-25200000).toISOString(), text:'Microsoft\'s cloud division reported accelerating growth as enterprise customers scaled AI workloads. Management raised full-year guidance and announced expanded data centre capacity across Europe.', url:'#', symbol:'MSFT', image:null },
+  { title:'Lloyds Banking Group sets aside £450m for motor finance redress', site:'Sky News', publishedDate: new Date(Date.now()-28800000).toISOString(), text:'Lloyds Banking Group has set aside an additional £450 million provision for potential motor finance mis-selling claims, bringing total provisions to over £1.1 billion as the FCA investigation continues.', url:'#', symbol:'LLOY.L', image:null },
+  { title:'S&P 500 hits fresh record as tech earnings beat expectations', site:'Yahoo Finance', publishedDate: new Date(Date.now()-32400000).toISOString(), text:'The S&P 500 closed at a new all-time high after a string of better-than-expected earnings reports from large-cap technology companies eased concerns about stretched valuations.', url:'#', symbol:'SPY', image:null },
+  { title:'Rolls-Royce raises profit outlook for second time this year', site:'The Guardian', publishedDate: new Date(Date.now()-36000000).toISOString(), text:'Rolls-Royce Holdings upgraded its profit guidance for the second consecutive time in 2025, citing strong demand for its Trent engine servicing business and improving defence revenues.', url:'#', symbol:'RR.L', image:null },
+  { title:'Amazon expands same-day delivery to 20 new UK cities', site:'Reuters', publishedDate: new Date(Date.now()-39600000).toISOString(), text:'Amazon announced a significant expansion of its same-day delivery network across the United Kingdom, investing £300 million in new fulfilment centres as competition with UK retailers intensifies.', url:'#', symbol:'AMZN', image:null },
+  { title:'BP targets net-zero transition with $8bn low-carbon investment pledge', site:'Financial Times', publishedDate: new Date(Date.now()-43200000).toISOString(), text:'BP set out a revised sustainability strategy targeting $8 billion in annual low-carbon investment by 2030, including significant expansion of offshore wind and hydrogen projects in the North Sea.', url:'#', symbol:'BP.L', image:null },
+  { title:'Meta Platforms posts 27% revenue growth; ad market recovery accelerates', site:'MarketWatch', publishedDate: new Date(Date.now()-46800000).toISOString(), text:'Meta reported strong quarterly results with digital advertising revenues surging 27%, driven by AI-powered ad targeting improvements across Facebook and Instagram platforms.', url:'#', symbol:'META', image:null },
+  { title:'Barclays investment bank revenues rise 18% on debt capital markets boom', site:'Bloomberg', publishedDate: new Date(Date.now()-50400000).toISOString(), text:'Barclays\'s investment banking division posted an 18% jump in revenues as corporate bond issuance hit multi-year highs and advisory fees from M&A activity rebounded strongly.', url:'#', symbol:'BARC.L', image:null },
+  { title:'Tesla cuts Model Y prices across Europe amid inventory build-up', site:'CNBC', publishedDate: new Date(Date.now()-54000000).toISOString(), text:'Tesla reduced Model Y pricing in several European markets by up to 6% as the company looks to clear elevated inventory levels. Analysts raised concerns about margin pressure in coming quarters.', url:'#', symbol:'TSLA', image:null },
+  { title:'FTSE 100 closes at six-month high as mining stocks rally', site:'Sky News', publishedDate: new Date(Date.now()-57600000).toISOString(), text:'The FTSE 100 reached a six-month high led by mining companies after iron ore prices rose sharply on expectations of Chinese stimulus measures aimed at boosting infrastructure spending.', url:'#', symbol:'RIO.L', image:null },
+];
+
+const SOURCE_COLORS = {
+  'Yahoo Finance':   '#6001D2',
+  'Reuters':         '#ff6600',
+  'Bloomberg':       '#1C1C1C',
+  'MarketWatch':     '#008040',
+  'Financial Times': '#FE4000',
+  'CNBC':            '#0077B5',
+  'BBC Business':    '#BB1919',
+  'Sky News':        '#0063BD',
+  'The Guardian':    '#052962',
+  'Benzinga':        '#00D4AA',
+  'Seeking Alpha':   '#1A73E8',
+};
+
+function sourceColor(site) { return SOURCE_COLORS[site] || '#6366f1'; }
+
+function timeAgo(dateStr) {
+  const diff = Date.now() - new Date(dateStr).getTime();
+  const m = Math.floor(diff / 60000);
+  if (m < 1)  return 'Just now';
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h/24)}d ago`;
+}
+
 // ─── LIVE API FETCHERS ────────────────────────────────────────────────────────
 async function apiFetch(path) {
   const url = `${FMP}${path}${path.includes('?')?'&':'?'}apikey=${state.apiKey}`;
@@ -1068,6 +1260,60 @@ async function fetchLiveHistory(sym, days) {
     if (!hist.length) throw new Error('empty');
     return hist.map(h => ({ date: h.date, close: h.close }));
   } catch(e) { console.warn('History fetch failed:', e.message); return null; }
+}
+
+// ─── NEWS FETCHERS ───────────────────────────────────────────────────────────
+async function fetchNews(tickers = '', limit = 20) {
+  const cacheKey = tickers || 'general';
+  const cached = state.newsCache[cacheKey];
+  if (cached && Date.now() - cached.ts < NEWS_CACHE_MS) return cached.data;
+  try {
+    const tickerParam = tickers ? `&tickers=${tickers}` : '';
+    const data = await apiFetch(`/stock_news?limit=${limit}${tickerParam}`);
+    if (!Array.isArray(data) || !data.length) throw new Error('empty');
+    state.newsCache[cacheKey] = { data, ts: Date.now() };
+    return data;
+  } catch(e) {
+    console.warn('News fetch failed:', e.message);
+    return null;
+  }
+}
+
+async function loadAndRenderNews() {
+  const main = document.getElementById('main');
+  if (!main || state.tab !== 'news') return;
+
+  if (!state.apiKey) { renderNews(main, MOCK_NEWS); return; }
+
+  // Show skeleton while loading
+  main.innerHTML = `<div style="display:flex;flex-direction:column;gap:20px;padding-top:8px">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:4px">${
+      ['All News','US Markets','UK Markets','Watchlist'].map(l=>`<div class="skeleton" style="height:32px;width:${l.length*9+24}px;border-radius:8px"></div>`).join('')
+    }</div>
+    <div class="news-grid">${Array(6).fill(0).map(()=>`
+      <div class="card" style="overflow:hidden">
+        <div class="skeleton" style="height:160px;width:100%"></div>
+        <div style="padding:14px;display:flex;flex-direction:column;gap:10px">
+          <div class="skeleton" style="height:12px;width:80px"></div>
+          <div class="skeleton" style="height:16px;width:100%"></div>
+          <div class="skeleton" style="height:16px;width:85%"></div>
+          <div class="skeleton" style="height:12px;width:100%"></div>
+          <div class="skeleton" style="height:12px;width:70%"></div>
+        </div>
+      </div>`).join('')}
+    </div>
+  </div>`;
+
+  let tickers = '';
+  const f = state.newsFilter;
+  if (f === 'us')        tickers = US_SYMBOLS.slice(0,15).join(',');
+  else if (f === 'uk')   tickers = UK_FTSE100.slice(0,10).join(',');
+  else if (f === 'watchlist') tickers = state.watchlist.join(',');
+
+  const articles = await fetchNews(tickers, 30);
+  state.newsLastRefresh = Date.now();
+  state._newsCached = articles || MOCK_NEWS;
+  renderNews(main, state._newsCached);
 }
 
 // ─── MARKET STATUS ────────────────────────────────────────────────────────────
@@ -1431,8 +1677,44 @@ window.screenerSort = function(key, val) {
 window.setAnalysisTab = function(tab) {
   state.analysisTab = tab;
   render();
-  if(tab==='chart') setTimeout(()=>renderPriceChart(state.selectedHistory),50);
-  if(tab==='overview'||tab==='fundamentals') setTimeout(()=>renderRadarChart(state.selectedStock?.scores),50);
+  if (tab==='chart') setTimeout(()=>renderPriceChart(state.selectedHistory), 50);
+  if (tab==='overview'||tab==='fundamentals') setTimeout(()=>renderRadarChart(state.selectedStock?.scores), 50);
+  if (tab==='news') loadStockNews(state.selectedSymbol);
+};
+
+async function loadStockNews(sym) {
+  if (!sym) return;
+  const container = document.getElementById('stockNewsContainer');
+  if (!container) return;
+  let articles;
+  if (state.apiKey) {
+    articles = await fetchNews(sym, 10);
+  }
+  if (!articles) {
+    // Filter mock news to this symbol or show general
+    articles = MOCK_NEWS.filter(a => a.symbol === sym || a.symbol === sym.replace('.L','')).length
+      ? MOCK_NEWS.filter(a => a.symbol === sym || a.symbol === sym.replace('.L',''))
+      : MOCK_NEWS.slice(0, 5);
+  }
+  if (container) container.innerHTML = stockNewsHTML(articles);
+}
+
+window.setNewsFilter = function(filter) {
+  state.newsFilter = filter;
+  state._newsCached = null;
+  render();
+};
+
+window.refreshNews = async function() {
+  // Clear cache for current filter so it re-fetches
+  const cacheKey = state.newsFilter === 'us'        ? US_SYMBOLS.slice(0,15).join(',')
+                 : state.newsFilter === 'uk'         ? UK_FTSE100.slice(0,10).join(',')
+                 : state.newsFilter === 'watchlist'  ? state.watchlist.join(',')
+                 : 'general';
+  delete state.newsCache[cacheKey];
+  state._newsCached = null;
+  showToast('Refreshing news…', 'info');
+  await loadAndRenderNews();
 };
 
 window.setChartRange = async function(days) {
