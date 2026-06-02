@@ -221,19 +221,44 @@ const FMP = 'https://financialmodelingprep.com/api/v3';
 const PRICE_REFRESH_MS    = 60_000;   // refresh all prices every 60 s
 const ANALYSIS_REFRESH_MS = 30_000;   // refresh open stock quote every 30 s
 const FUND_CACHE_MS       = 600_000;  // cache fundamentals for 10 min
-const SYMBOLS = ['AAPL','MSFT','GOOGL','AMZN','NVDA','META','TSLA','BRK-B','JPM','JNJ',
+// US symbols
+const US_SYMBOLS = ['AAPL','MSFT','GOOGL','AMZN','NVDA','META','TSLA','BRK-B','JPM','JNJ',
   'V','PG','UNH','MA','HD','CVX','MRK','ABBV','PEP','KO',
   'AVGO','COST','LLY','TMO','MCD','DIS','ACN','DHR','NEE','IBM',
   'NFLX','ADBE','CRM','AMD','INTC','QCOM','TXN','AMAT','ORCL','PYPL'];
+
+// UK symbols — prices returned in pence (GBp) by FMP
+const UK_FTSE100 = ['SHEL.L','AZN.L','HSBA.L','ULVR.L','BP.L','RIO.L','GSK.L','LSEG.L',
+  'REL.L','DGE.L','LLOY.L','BARC.L','NG.L','BA.L','RR.L','TSCO.L',
+  'STAN.L','NWG.L','PRU.L','III.L','IMB.L','CPG.L','EXPN.L','WPP.L','VOD.L'];
+const UK_FTSE250 = ['EZJ.L','ITV.L','OCDO.L','JDW.L','MNG.L','HLN.L','SMWH.L','ABF.L','TUI.L','AUTO.L'];
+const UK_AIM     = ['FEVR.L','BOO.L','KWS.L','GAMA.L','BCPT.L'];
+const ALL_UK     = [...UK_FTSE100, ...UK_FTSE250, ...UK_AIM];
+
+// Combined — used for batch refresh when market = 'all'
+const SYMBOLS = [...US_SYMBOLS];  // default; extended dynamically when UK loaded
+const ALL_SYMBOLS = [...US_SYMBOLS, ...ALL_UK];
+
+// Which index each UK symbol belongs to (for display)
+const UK_INDEX_MAP = {};
+UK_FTSE100.forEach(s => UK_INDEX_MAP[s] = 'FTSE 100');
+UK_FTSE250.forEach(s => UK_INDEX_MAP[s] = 'FTSE 250');
+UK_AIM.forEach(s    => UK_INDEX_MAP[s] = 'AIM');
+
 const SECTORS = ['Technology','Healthcare','Financials','Consumer Discretionary','Industrials',
   'Energy','Utilities','Materials','Real Estate','Communication Services','Consumer Staples'];
-const INDICES = [
-  {name:'S&P 500',short:'SPX',base:5200},
-  {name:'NASDAQ',short:'NDX',base:16400},
-  {name:'Dow Jones',short:'DJIA',base:39800},
-  {name:'Russell 2000',short:'RUT',base:2050},
-  {name:'FTSE 100',short:'FTSE',base:8100},
-  {name:'Nikkei 225',short:'N225',base:38500}
+
+const US_INDICES = [
+  {name:'S&P 500',   short:'SPX', base:5200,  fmpSymbol:'^GSPC'},
+  {name:'NASDAQ',    short:'NDX', base:16400, fmpSymbol:'^IXIC'},
+  {name:'Dow Jones', short:'DJIA',base:39800, fmpSymbol:'^DJI'},
+  {name:'Russell 2000',short:'RUT',base:2050, fmpSymbol:'^RUT'},
+];
+const UK_INDICES = [
+  {name:'FTSE 100',   short:'UKX', base:8100, fmpSymbol:'^FTSE'},
+  {name:'FTSE 250',   short:'MCX', base:20500,fmpSymbol:'^FTMC'},
+  {name:'FTSE SmallCap',short:'SMX',base:5900,fmpSymbol:'^FTSC'},
+  {name:'AIM All-Share',short:'AIM',base:740, fmpSymbol:'^AIM'},
 ];
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
@@ -251,7 +276,7 @@ const state = {
   chartObj: null,
   radarObj: null,
   screenerSort: {by:'score',dir:'desc'},
-  screenerFilter: {sector:'',minScore:0},
+  screenerFilter: {sector:'',minScore:0,market:'all'},
   // auto-refresh
   priceTimer: null,
   analysisTimer: null,
@@ -268,10 +293,37 @@ function seedRng(str) {
   return function(){ h^=h<<13;h^=h>>17;h^=h<<5; return (h>>>0)/4294967296; };
 }
 
+function isUK(sym) { return sym.endsWith('.L'); }
+
+// Price display — UK stocks quoted in pence on LSE
+function fPrice(n, sym) {
+  if (n == null || isNaN(n)) return 'N/A';
+  if (isUK(sym)) return n.toFixed(0) + 'p';
+  return '$' + n.toFixed(2);
+}
+function fMktCap(n, sym) {
+  if (n == null || isNaN(n)) return 'N/A';
+  const prefix = isUK(sym) ? '£' : '$';
+  // UK market caps from FMP are in GBP (not pence)
+  if (Math.abs(n) >= 1e12) return prefix + (n/1e12).toFixed(2) + 'T';
+  if (Math.abs(n) >= 1e9)  return prefix + (n/1e9).toFixed(2) + 'B';
+  if (Math.abs(n) >= 1e6)  return prefix + (n/1e6).toFixed(2) + 'M';
+  return prefix + n.toFixed(0);
+}
+
 function mockStock(sym) {
   const r = seedRng(sym + '2025');
-  const bases = {AAPL:189,MSFT:415,GOOGL:176,AMZN:185,NVDA:875,META:505,TSLA:246,JPM:198,JNJ:152,V:276,NFLX:630,ADBE:490};
-  const base = bases[sym] || 80 + r()*320;
+  // UK base prices in pence
+  const bases = {
+    AAPL:189,MSFT:415,GOOGL:176,AMZN:185,NVDA:875,META:505,TSLA:246,JPM:198,JNJ:152,V:276,NFLX:630,ADBE:490,
+    'SHEL.L':2780,'AZN.L':10540,'HSBA.L':695,'ULVR.L':3820,'BP.L':453,'RIO.L':5180,'GSK.L':1695,
+    'LSEG.L':9480,'REL.L':3410,'DGE.L':2290,'LLOY.L':55,'BARC.L':228,'NG.L':948,'BA.L':1248,
+    'RR.L':498,'TSCO.L':362,'STAN.L':847,'NWG.L':378,'PRU.L':752,'III.L':2980,'IMB.L':2490,
+    'CPG.L':2180,'EXPN.L':3490,'WPP.L':798,'VOD.L':72,
+    'EZJ.L':448,'ITV.L':84,'OCDO.L':348,'JDW.L':748,'MNG.L':218,'HLN.L':328,'SMWH.L':1290,'ABF.L':2095,'TUI.L':598,'AUTO.L':1580,
+    'FEVR.L':1185,'BOO.L':28,'KWS.L':1420,'GAMA.L':185,'BCPT.L':74,
+  };
+  const base = bases[sym] || (isUK(sym) ? 200 + r()*2000 : 80 + r()*320);
   const chgPct = (r()-0.47)*5;
   const chg = base * chgPct/100;
   const pe = 10+r()*45;
@@ -283,18 +335,54 @@ function mockStock(sym) {
   const cr = 0.8+r()*3;
   const gm = 20+r()*55;
   const ic = 2+r()*20;
+  const ukNames = {
+    'SHEL.L':'Shell plc','AZN.L':'AstraZeneca plc','HSBA.L':'HSBC Holdings plc',
+    'ULVR.L':'Unilever plc','BP.L':'BP plc','RIO.L':'Rio Tinto plc','GSK.L':'GSK plc',
+    'LSEG.L':'London Stock Exchange Group','REL.L':'RELX plc','DGE.L':'Diageo plc',
+    'LLOY.L':'Lloyds Banking Group','BARC.L':'Barclays plc','NG.L':'National Grid plc',
+    'BA.L':'BAE Systems plc','RR.L':'Rolls-Royce Holdings plc','TSCO.L':'Tesco plc',
+    'STAN.L':'Standard Chartered plc','NWG.L':'NatWest Group plc','PRU.L':'Prudential plc',
+    'III.L':'3i Group plc','IMB.L':'Imperial Brands plc','CPG.L':'Compass Group plc',
+    'EXPN.L':'Experian plc','WPP.L':'WPP plc','VOD.L':'Vodafone Group plc',
+    'EZJ.L':'easyJet plc','ITV.L':'ITV plc','OCDO.L':'Ocado Group plc',
+    'JDW.L':'JD Wetherspoon plc','MNG.L':'M&G plc','HLN.L':'Haleon plc',
+    'SMWH.L':'WH Smith plc','ABF.L':'Associated British Foods','TUI.L':'TUI AG','AUTO.L':'Auto Trader Group',
+    'FEVR.L':'Fevertree Drinks plc','BOO.L':'Boohoo Group plc','KWS.L':'Keywords Studios plc',
+    'GAMA.L':'Gamma Communications','BCPT.L':'Balanced Commercial Property Trust',
+  };
+  const ukSectors = {
+    'SHEL.L':'Energy','AZN.L':'Healthcare','HSBA.L':'Financials','ULVR.L':'Consumer Staples',
+    'BP.L':'Energy','RIO.L':'Materials','GSK.L':'Healthcare','LSEG.L':'Financials',
+    'REL.L':'Technology','DGE.L':'Consumer Staples','LLOY.L':'Financials','BARC.L':'Financials',
+    'NG.L':'Utilities','BA.L':'Industrials','RR.L':'Industrials','TSCO.L':'Consumer Staples',
+    'STAN.L':'Financials','NWG.L':'Financials','PRU.L':'Financials','III.L':'Financials',
+    'IMB.L':'Consumer Staples','CPG.L':'Consumer Discretionary','EXPN.L':'Technology',
+    'WPP.L':'Communication Services','VOD.L':'Communication Services',
+    'EZJ.L':'Industrials','ITV.L':'Communication Services','OCDO.L':'Consumer Discretionary',
+    'JDW.L':'Consumer Discretionary','MNG.L':'Financials','HLN.L':'Healthcare',
+    'SMWH.L':'Consumer Discretionary','ABF.L':'Consumer Staples','TUI.L':'Consumer Discretionary',
+    'AUTO.L':'Technology','FEVR.L':'Consumer Staples','BOO.L':'Consumer Discretionary',
+    'KWS.L':'Technology','GAMA.L':'Technology','BCPT.L':'Real Estate',
+  };
+  const uk = isUK(sym);
+  // UK market caps stored in GBP (FMP returns GBP not pence for market cap)
+  const mcap = uk ? base * (1e4 + r()*3e9) : base * (5e8 + r()*3e12);
   return {
-    symbol:sym, name:sym+' Corporation', price:base, change:chg, changePercent:chgPct,
-    marketCap:base*(5e8+r()*3e12), volume:Math.floor(5e5+r()*5e7),
+    symbol:sym,
+    name: uk ? (ukNames[sym] || sym.replace('.L',' plc')) : sym+' Corporation',
+    price:base, change:chg, changePercent:chgPct,
+    marketCap: mcap,
+    volume:Math.floor(5e5+r()*5e7),
     pe, eps:2+r()*14, pb:1+r()*9, ps:1+r()*18, roe, roa:2+r()*18,
     debtToEquity:de, currentRatio:cr, quickRatio:0.5+r()*2.5,
     grossMargin:gm, operatingMargin:gm*0.5, netMargin:netM,
     revenueGrowth:revGrow, earningsGrowth:eGrow,
-    dividendYield:r()*4.5, beta:0.5+r()*1.5,
+    dividendYield:r()*(uk?5:4.5), beta:0.5+r()*1.5,
     week52High:base*(1.05+r()*0.3), week52Low:base*(0.65+r()*0.25),
-    sector:SECTORS[Math.floor(r()*SECTORS.length)],
-    exchange:r()>0.5?'NASDAQ':'NYSE',
-    description:`${sym} is a leading company that delivers innovative solutions to customers worldwide through technology, operational excellence, and strategic execution.`,
+    sector: uk ? (ukSectors[sym]||SECTORS[Math.floor(r()*SECTORS.length)]) : SECTORS[Math.floor(r()*SECTORS.length)],
+    exchange: uk ? (UK_INDEX_MAP[sym]||'LSE') : (r()>0.5?'NASDAQ':'NYSE'),
+    market: uk ? 'UK' : 'US',
+    description:`${uk?(ukNames[sym]||sym):sym} is a leading company delivering strong results through operational excellence and strategic investment.`,
     employees:Math.floor(2000+r()*220000),
     freeCashFlow:1e8+r()*4e10,
     evToEbitda:5+r()*28, pfcf:10+r()*45,
@@ -374,15 +462,20 @@ function scoreLabel(v){return v>=75?'Excellent':v>=60?'Good':v>=45?'Fair':'Poor'
 function scoreBadge(v){return v>=60?'badge-green':v>=45?'badge-yellow':'badge-red'}
 
 // ─── FORMATTERS ───────────────────────────────────────────────────────────────
-function fP(n){return n==null||isNaN(n)?'N/A':'$'+n.toFixed(2)}
+function fP(n,sym){
+  if(n==null||isNaN(n))return'N/A';
+  if(sym&&isUK(sym))return n>=100?n.toFixed(0)+'p':n.toFixed(2)+'p';
+  return'$'+n.toFixed(2);
+}
 function fPct(n){return n==null||isNaN(n)?'N/A':n.toFixed(2)+'%'}
 function fX(n){return n==null||isNaN(n)?'N/A':n.toFixed(2)+'x'}
-function fBig(n){
+function fBig(n,sym){
   if(n==null||isNaN(n))return'N/A';
-  if(Math.abs(n)>=1e12)return'$'+(n/1e12).toFixed(2)+'T';
-  if(Math.abs(n)>=1e9)return'$'+(n/1e9).toFixed(2)+'B';
-  if(Math.abs(n)>=1e6)return'$'+(n/1e6).toFixed(2)+'M';
-  return'$'+n.toFixed(0);
+  const pre=sym&&isUK(sym)?'£':'$';
+  if(Math.abs(n)>=1e12)return pre+(n/1e12).toFixed(2)+'T';
+  if(Math.abs(n)>=1e9)return pre+(n/1e9).toFixed(2)+'B';
+  if(Math.abs(n)>=1e6)return pre+(n/1e6).toFixed(2)+'M';
+  return pre+n.toFixed(0);
 }
 function fVol(n){
   if(!n)return'N/A';
@@ -478,61 +571,93 @@ function render() {
 
 // ─── OVERVIEW ────────────────────────────────────────────────────────────────
 function renderOverview(main) {
-  // Build market data if empty
-  if(!state.marketData.length) {
-    state.marketData = SYMBOLS.map(s=>{const d=mockStock(s);const {scores}=score(d);return{...d,scores}});
+  // Seed market data from all symbols if empty
+  if (!state.marketData.length) {
+    state.marketData = ALL_SYMBOLS.map(s => { const d=mockStock(s); const {scores}=score(d); return {...d,scores}; });
   }
 
-  const gainers = [...state.marketData].sort((a,b)=>b.changePercent-a.changePercent).slice(0,8);
-  const losers  = [...state.marketData].sort((a,b)=>a.changePercent-b.changePercent).slice(0,8);
+  const view = state.overviewMarket || 'all';
 
-  const idxHTML = INDICES.map(idx => {
-    const r = seedRng(idx.short+'day');
-    const chg = (r()-0.47)*2.2;
-    const up = chg>=0;
-    const val = idx.base*(1+chg/100);
-    return `<div class="idx-card">
-      <div style="font-size:11px;color:#64748b">${idx.short}</div>
-      <div style="font-weight:700;font-size:14px;margin:4px 0">${idx.name}</div>
-      <div style="font-size:20px;font-weight:700">${val.toLocaleString('en',{maximumFractionDigits:0})}</div>
-      <div class="${up?'up':'down'}" style="font-size:13px;font-weight:600">${up?'+':''}${chg.toFixed(2)}%</div>
-    </div>`;
-  }).join('');
+  const visibleData = view === 'us'  ? state.marketData.filter(s => s.market==='US')
+                    : view === 'uk'  ? state.marketData.filter(s => s.market==='UK')
+                    : state.marketData;
+
+  const gainers = [...visibleData].sort((a,b)=>b.changePercent-a.changePercent).slice(0,8);
+  const losers  = [...visibleData].sort((a,b)=>a.changePercent-b.changePercent).slice(0,8);
+
+  // Index cards
+  function idxCards(indices) {
+    return indices.map(idx => {
+      const r = seedRng(idx.short+'day26');
+      const chg = (r()-0.47)*2.2;
+      const up = chg >= 0;
+      const val = idx.base*(1+chg/100);
+      return `<div class="idx-card">
+        <div style="font-size:11px;color:#64748b">${idx.short}</div>
+        <div style="font-weight:700;font-size:13px;margin:3px 0">${idx.name}</div>
+        <div style="font-size:18px;font-weight:700">${val.toLocaleString('en',{maximumFractionDigits:0})}</div>
+        <div class="${up?'up':'down'}" style="font-size:13px;font-weight:600">${up?'+':''}${chg.toFixed(2)}%</div>
+      </div>`;
+    }).join('');
+  }
 
   function tableRows(arr) {
-    return arr.map(s=>`<tr onclick="analyzeStock('${s.symbol}')" style="cursor:pointer" data-price-sym="${s.symbol}">
-      <td class="sym">${s.symbol}</td>
-      <td><span data-field="price" data-prev="${s.price}">${fP(s.price)}</span></td>
-      <td><span data-field="change" class="${s.changePercent>=0?'up':'down'}">${s.changePercent>=0?'+':''}${fPct(s.changePercent)}</span></td>
-      <td style="color:#94a3b8">${fBig(s.marketCap)}</td>
-      <td style="color:#94a3b8">${fVol(s.volume)}</td>
-    </tr>`).join('');
+    return arr.map(s => {
+      const up = s.changePercent >= 0;
+      const ukBadge = s.market==='UK' ? `<span class="badge badge-blue" style="font-size:10px;margin-left:4px">${UK_INDEX_MAP[s.symbol]||'LSE'}</span>` : '';
+      return `<tr onclick="analyzeStock('${s.symbol}')" style="cursor:pointer" data-price-sym="${s.symbol}">
+        <td class="sym">${s.symbol.replace('.L','')}${ukBadge}</td>
+        <td><span data-field="price" data-prev="${s.price}">${fP(s.price,s.symbol)}</span></td>
+        <td><span data-field="change" class="${up?'up':'down'}">${up?'+':''}${fPct(s.changePercent)}</span></td>
+        <td style="color:#94a3b8">${fBig(s.marketCap,s.symbol)}</td>
+        <td style="color:#94a3b8">${fVol(s.volume)}</td>
+      </tr>`;
+    }).join('');
   }
 
-  const gridCards = state.marketData.map(s=>`
-    <div class="stock-card" onclick="analyzeStock('${s.symbol}')" data-price-sym="${s.symbol}">
-      <div class="sym" style="font-size:14px">${s.symbol}</div>
-      <div style="font-weight:700;margin:4px 0"><span data-field="price" data-prev="${s.price}">${fP(s.price)}</span></div>
-      <div style="font-size:12px"><span data-field="change" class="${s.changePercent>=0?'up':'down'}">${s.changePercent>=0?'+':''}${fPct(s.changePercent)}</span></div>
+  const gridCards = visibleData.map(s => {
+    const up = s.changePercent >= 0;
+    const label = s.market==='UK' ? s.symbol.replace('.L','') : s.symbol;
+    return `<div class="stock-card" onclick="analyzeStock('${s.symbol}')" data-price-sym="${s.symbol}">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start">
+        <div class="sym" style="font-size:13px">${label}</div>
+        ${s.market==='UK'?`<span style="font-size:9px;color:#818cf8;background:rgba(99,102,241,.15);border-radius:4px;padding:1px 5px">${UK_INDEX_MAP[s.symbol]||'LSE'}</span>`:''}
+      </div>
+      <div style="font-weight:700;margin:4px 0;font-size:14px"><span data-field="price" data-prev="${s.price}">${fP(s.price,s.symbol)}</span></div>
+      <div style="font-size:12px"><span data-field="change" class="${up?'up':'down'}">${up?'+':''}${fPct(s.changePercent)}</span></div>
       <div style="display:flex;align-items:center;gap:4px;margin-top:8px">
         <span style="font-size:11px;color:#64748b">Score</span>
         <span style="font-size:12px;font-weight:700" class="${scoreClass(s.scores.overall)}">${s.scores.overall}</span>
         ${barHTML(s.scores.overall,scoreColor(s.scores.overall))}
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
+
+  const mktBtns = [['all','All Markets'],['us','🇺🇸 US'],['uk','🇬🇧 UK']].map(([v,l]) =>
+    `<button onclick="setOverviewMarket('${v}')" class="tab-btn ${view===v?'active':''}" style="padding:5px 14px;font-size:12px">${l}</button>`
+  ).join('');
 
   main.innerHTML = `
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
-      <div>
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:16px">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
         <span style="font-size:20px;font-weight:700">Market Overview</span>
-        ${state.apiKey ? `<span style="font-size:12px;color:#64748b;margin-left:10px">Prices refresh every 60s</span>` : `<span style="font-size:12px;color:#f59e0b;margin-left:10px">Demo data — add API key in Settings for live prices</span>`}
+        <div style="display:flex;gap:4px">${mktBtns}</div>
+        ${state.apiKey ? `<span style="font-size:12px;color:#64748b">Auto-refreshing every 60s</span>` : `<span style="font-size:12px;color:#f59e0b">Demo data — add API key in Settings</span>`}
       </div>
       <button class="refresh-btn" onclick="manualRefresh()">↻ Refresh now</button>
     </div>
+
+    ${view !== 'uk' ? `
     <div style="margin-bottom:20px">
-      <div class="section-title">Market Indices</div>
-      <div class="grid6">${idxHTML}</div>
-    </div>
+      <div class="section-title">🇺🇸 US Indices</div>
+      <div class="grid4">${idxCards(US_INDICES)}</div>
+    </div>` : ''}
+
+    ${view !== 'us' ? `
+    <div style="margin-bottom:20px">
+      <div class="section-title">🇬🇧 UK Indices</div>
+      <div class="grid4">${idxCards(UK_INDICES)}</div>
+    </div>` : ''}
 
     <div class="grid2" style="margin-bottom:20px">
       <div>
@@ -552,45 +677,62 @@ function renderOverview(main) {
     </div>
 
     <div>
-      <div class="section-title">All Stocks — click any to analyse</div>
+      <div class="section-title">All ${view==='us'?'US ':view==='uk'?'UK ':''}Stocks — click any to analyse</div>
       <div class="grid-auto">${gridCards}</div>
     </div>`;
 }
 
 // ─── SCREENER ─────────────────────────────────────────────────────────────────
 function renderScreener(main) {
-  if(!state.screenerData.length) {
-    state.screenerData = SYMBOLS.map(s=>{const d=mockStock(s);const {scores}=score(d);return{...d,scores}});
+  if (!state.screenerData.length) {
+    state.screenerData = ALL_SYMBOLS.map(s => { const d=mockStock(s); const {scores}=score(d); return {...d,scores}; });
   }
 
   let data = [...state.screenerData];
-  if(state.screenerFilter.sector) data=data.filter(s=>s.sector===state.screenerFilter.sector);
-  if(state.screenerFilter.minScore>0) data=data.filter(s=>s.scores.overall>=state.screenerFilter.minScore);
-  data.sort((a,b)=>{
-    let av,bv;
-    if(state.screenerSort.by==='score'){av=a.scores.overall;bv=b.scores.overall}
-    else if(state.screenerSort.by==='marketCap'){av=a.marketCap;bv=b.marketCap}
-    else if(state.screenerSort.by==='pe'){av=a.pe||999;bv=b.pe||999}
-    else{av=a.changePercent;bv=b.changePercent}
-    return state.screenerSort.dir==='desc'?bv-av:av-bv;
+  const mf = state.screenerFilter.market || 'all';
+  if (mf === 'us') data = data.filter(s => s.market === 'US');
+  if (mf === 'uk') data = data.filter(s => s.market === 'UK');
+  // UK sub-index filter
+  if (mf === 'ftse100') data = data.filter(s => UK_FTSE100.includes(s.symbol));
+  if (mf === 'ftse250') data = data.filter(s => UK_FTSE250.includes(s.symbol));
+  if (mf === 'aim')     data = data.filter(s => UK_AIM.includes(s.symbol));
+  if (state.screenerFilter.sector)   data = data.filter(s => s.sector === state.screenerFilter.sector);
+  if (state.screenerFilter.minScore > 0) data = data.filter(s => s.scores.overall >= state.screenerFilter.minScore);
+
+  data.sort((a,b) => {
+    let av, bv;
+    if (state.screenerSort.by==='score')     { av=a.scores.overall; bv=b.scores.overall }
+    else if (state.screenerSort.by==='marketCap') { av=a.marketCap; bv=b.marketCap }
+    else if (state.screenerSort.by==='pe')   { av=a.pe||999; bv=b.pe||999 }
+    else { av=a.changePercent; bv=b.changePercent }
+    return state.screenerSort.dir==='desc' ? bv-av : av-bv;
   });
 
-  const sectorOpts = SECTORS.map(s=>`<option value="${s}" ${state.screenerFilter.sector===s?'selected':''}>${s}</option>`).join('');
-  const scoreOpts = [[0,'Any Score'],[60,'≥ 60'],[70,'≥ 70'],[80,'≥ 80']].map(([v,l])=>`<option value="${v}" ${state.screenerFilter.minScore===v?'selected':''}>${l}</option>`).join('');
-  const sortOpts = [['score','Overall Score'],['marketCap','Market Cap'],['pe','P/E Ratio'],['changePercent','% Change']].map(([v,l])=>`<option value="${v}" ${state.screenerSort.by===v?'selected':''}>${l}</option>`).join('');
+  const mktOpts = [
+    ['all','All Markets'],['us','🇺🇸 US'],['uk','🇬🇧 All UK'],
+    ['ftse100','FTSE 100'],['ftse250','FTSE 250'],['aim','AIM'],
+  ].map(([v,l]) => `<option value="${v}" ${mf===v?'selected':''}>${l}</option>`).join('');
 
-  const rows = data.map(s=>{
-    const up=s.changePercent>=0;
-    const {overall,valuation,profitability,growth,health}=s.scores;
-    function scoreCell(v){return`<td><div style="display:flex;align-items:center;gap:6px"><span style="color:${scoreColor(v)};font-weight:600;font-size:12px;min-width:24px">${v}</span>${barHTML(v,scoreColor(v))}</div></td>`}
+  const sectorOpts = SECTORS.map(s=>`<option value="${s}" ${state.screenerFilter.sector===s?'selected':''}>${s}</option>`).join('');
+  const scoreOpts  = [[0,'Any Score'],[60,'≥ 60'],[70,'≥ 70'],[80,'≥ 80']].map(([v,l])=>`<option value="${v}" ${state.screenerFilter.minScore===v?'selected':''}>${l}</option>`).join('');
+  const sortOpts   = [['score','Overall Score'],['marketCap','Market Cap'],['pe','P/E Ratio'],['changePercent','% Change']].map(([v,l])=>`<option value="${v}" ${state.screenerSort.by===v?'selected':''}>${l}</option>`).join('');
+
+  const rows = data.map(s => {
+    const up = s.changePercent >= 0;
+    const {overall,valuation,profitability,growth,health} = s.scores;
+    const displaySym = s.market==='UK' ? s.symbol.replace('.L','') : s.symbol;
+    const mktBadge   = s.market==='UK'
+      ? `<span class="badge badge-blue" style="font-size:9px;margin-left:4px">${UK_INDEX_MAP[s.symbol]||'LSE'}</span>`
+      : `<span class="badge" style="font-size:9px;margin-left:4px;background:rgba(16,185,129,.1);color:#10b981">NYSE/NDQ</span>`;
+    function scoreCell(v){ return `<td><div style="display:flex;align-items:center;gap:6px"><span style="color:${scoreColor(v)};font-weight:600;font-size:12px;min-width:24px">${v}</span>${barHTML(v,scoreColor(v))}</div></td>`; }
     return `<tr onclick="analyzeStock('${s.symbol}')" style="cursor:pointer">
-      <td class="sym">${s.symbol}</td>
+      <td class="sym">${displaySym}${mktBadge}</td>
       <td style="color:#94a3b8;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.name}</td>
-      <td>${fP(s.price)}</td>
+      <td>${fP(s.price,s.symbol)}</td>
       <td class="${up?'up':'down'}">${up?'+':''}${fPct(s.changePercent)}</td>
-      <td style="color:#94a3b8">${fBig(s.marketCap)}</td>
+      <td style="color:#94a3b8">${fBig(s.marketCap,s.symbol)}</td>
       <td style="color:#94a3b8">${s.pe?s.pe.toFixed(1)+'x':'N/A'}</td>
-      <td><span class="badge badge-blue" style="font-size:10px">${s.sector.split(' ')[0]}</span></td>
+      <td><span class="badge badge-blue" style="font-size:10px">${(s.sector||'—').split(' ')[0]}</span></td>
       ${scoreCell(valuation)}${scoreCell(profitability)}${scoreCell(growth)}${scoreCell(health)}
       <td><span class="badge ${scoreBadge(overall)}" style="font-size:13px;padding:3px 10px">${overall}</span></td>
       <td><button class="btn-sm" onclick="event.stopPropagation();analyzeStock('${s.symbol}')">Analyse →</button></td>
@@ -600,15 +742,14 @@ function renderScreener(main) {
   main.innerHTML = `
     <div class="filter-row">
       <span style="font-size:16px;font-weight:700">Stock Screener</span>
+      <select onchange="screenerFilter('market',this.value)">${mktOpts}</select>
       <select onchange="screenerFilter('sector',this.value)"><option value="">All Sectors</option>${sectorOpts}</select>
       <select onchange="screenerFilter('minScore',+this.value)">${scoreOpts}</select>
       <select onchange="screenerSort('by',this.value)">${sortOpts}</select>
-      <button class="btn btn-ghost" onclick="screenerSort('dir',null)" style="font-size:13px">
-        ${state.screenerSort.dir==='desc'?'↓ Desc':'↑ Asc'}
-      </button>
+      <button class="btn btn-ghost" onclick="screenerSort('dir',null)" style="font-size:13px">${state.screenerSort.dir==='desc'?'↓ Desc':'↑ Asc'}</button>
       <span style="font-size:13px;color:#64748b">${data.length} stocks</span>
       <button class="refresh-btn" onclick="manualRefresh()">↻ Refresh</button>
-      ${state.lastRefresh ? `<span style="font-size:11px;color:#64748b">Updated ${Math.round((Date.now()-state.lastRefresh)/1000)}s ago</span>` : ''}
+      ${state.lastRefresh?`<span style="font-size:11px;color:#64748b">Updated ${Math.round((Date.now()-state.lastRefresh)/1000)}s ago</span>`:''}
     </div>
     <div class="card table-wrap">
       <table>
@@ -642,7 +783,7 @@ function renderWatchlist(main) {
       </div>
       <div style="margin-top:12px;display:flex;justify-content:space-between;align-items:flex-end">
         <div>
-          <div style="font-size:22px;font-weight:700">${fP(s.price)}</div>
+          <div style="font-size:22px;font-weight:700">${fP(s.price,s.symbol)}</div>
           <div class="${up?'up':'down'}" style="font-size:13px;font-weight:600">${up?'+':''}${fPct(s.changePercent)} today</div>
         </div>
         <div style="text-align:right;font-size:12px;color:#64748b">
@@ -744,8 +885,8 @@ function renderAnalysis(container) {
           </div>
         </div>
         <div style="text-align:right" id="analysisPriceBlock">
-          <div class="price-big">${fP(s.price)}</div>
-          <div class="change-big ${up?'up':'down'}">${up?'+':''}${fPct(s.changePercent)} &nbsp;(${up?'+':''}${fP(s.change)})</div>
+          <div class="price-big">${fP(s.price,s.symbol)}</div>
+          <div class="change-big ${up?'up':'down'}">${up?'+':''}${fPct(s.changePercent)} &nbsp;(${up?'+':''}${fP(s.change,s.symbol)})</div>
           <div style="font-size:11px;color:#64748b;margin-top:4px">
             ${state.apiKey ? `Vol: ${fVol(s.volume)} &nbsp;·&nbsp; Auto-refreshing every 30s` : 'Demo data'}
           </div>
@@ -792,8 +933,8 @@ function renderAnalysis(container) {
 
 function renderAnalysisOverview(s) {
   const metrics=[
-    ['Market Cap',fBig(s.marketCap)],['Volume',fVol(s.volume)],['P/E Ratio',fX(s.pe)],['EPS',fP(s.eps)],
-    ['52W High',fP(s.week52High)],['52W Low',fP(s.week52Low)],['Beta',s.beta?.toFixed(2)||'N/A'],['Dividend Yield',fPct(s.dividendYield)],
+    ['Market Cap',fBig(s.marketCap,s.symbol)],['Volume',fVol(s.volume)],['P/E Ratio',fX(s.pe)],['EPS',fP(s.eps,s.symbol)],
+    ['52W High',fP(s.week52High,s.symbol)],['52W Low',fP(s.week52Low,s.symbol)],['Beta',s.beta?.toFixed(2)||'N/A'],['Dividend Yield',fPct(s.dividendYield)],
     ['P/B Ratio',fX(s.pb)],['P/S Ratio',fX(s.ps)],['EV/EBITDA',fX(s.evToEbitda)],['P/FCF',fX(s.pfcf)]
   ];
   return`<div class="grid4">
@@ -834,8 +975,8 @@ function renderAnalysisFundamentals(s) {
     ${section('Valuation','valuation',[['P/E Ratio',fX(s.pe)],['P/B Ratio',fX(s.pb)],['P/S Ratio',fX(s.ps)],['EV/EBITDA',fX(s.evToEbitda)],['P/FCF',fX(s.pfcf)]])}
     ${section('Profitability','profitability',[['Gross Margin',fPct(s.grossMargin)],['Operating Margin',fPct(s.operatingMargin)],['Net Margin',fPct(s.netMargin)],['ROE',fPct(s.roe)],['ROA',fPct(s.roa)]])}
     ${section('Growth','growth',[['Revenue Growth (YoY)',fPct(s.revenueGrowth)],['Earnings Growth (YoY)',fPct(s.earningsGrowth)]])}
-    ${section('Financial Health','health',[['Current Ratio',fX(s.currentRatio)],['Quick Ratio',fX(s.quickRatio)],['Debt / Equity',fX(s.debtToEquity)],['Interest Coverage',fX(s.interestCoverage)],['Free Cash Flow',fBig(s.freeCashFlow)]])}
-    ${section('Dividend & Momentum','dividend',[['Dividend Yield',fPct(s.dividendYield)],['Beta',s.beta?.toFixed(2)||'N/A'],['52W High',fP(s.week52High)],['52W Low',fP(s.week52Low)]])}
+    ${section('Financial Health','health',[['Current Ratio',fX(s.currentRatio)],['Quick Ratio',fX(s.quickRatio)],['Debt / Equity',fX(s.debtToEquity)],['Interest Coverage',fX(s.interestCoverage)],['Free Cash Flow',fBig(s.freeCashFlow,s.symbol)]])}
+    ${section('Dividend & Momentum','dividend',[['Dividend Yield',fPct(s.dividendYield)],['Beta',s.beta?.toFixed(2)||'N/A'],['52W High',fP(s.week52High,s.symbol)],['52W Low',fP(s.week52Low,s.symbol)]])}
   </div>`;
 }
 
@@ -985,7 +1126,7 @@ function startClock() {
 async function refreshAllPrices() {
   if (!state.apiKey) return;
   try {
-    const quotes = await fetchBatchQuotes(SYMBOLS);
+    const quotes = await fetchBatchQuotes(ALL_SYMBOLS);
     if (!quotes.length) return;
     state.lastRefresh = Date.now();
 
@@ -1270,6 +1411,11 @@ window.removeWatchlist = function(sym) {
   render();
 };
 
+window.setOverviewMarket = function(market) {
+  state.overviewMarket = market;
+  render();
+};
+
 window.screenerFilter = function(key, val) {
   if(key==='minScore') state.screenerFilter.minScore=+val;
   else state.screenerFilter[key]=val;
@@ -1308,11 +1454,11 @@ window.saveApiKey = async function() {
   if (state.apiKey) {
     showToast('API key saved — fetching live data…', 'info');
     // Load initial batch of prices for overview + screener
-    const quotes = await fetchBatchQuotes(SYMBOLS);
+    const quotes = await fetchBatchQuotes(ALL_SYMBOLS);
     if (quotes.length) {
       const map = {};
       quotes.forEach(q => { map[q.symbol] = q; });
-      state.marketData = SYMBOLS.map(sym => {
+      state.marketData = ALL_SYMBOLS.map(sym => {
         const q = map[sym] || {};
         const base = mockStock(sym);
         const merged = { ...base,
@@ -1358,9 +1504,13 @@ const dropdown = document.getElementById('searchDropdown');
 searchInput.addEventListener('input', () => {
   const q = searchInput.value.toUpperCase().trim();
   if(!q){dropdown.style.display='none';return}
-  const matches = SYMBOLS.filter(s=>s.startsWith(q)||s.includes(q)).slice(0,8);
+  const matches = ALL_SYMBOLS.filter(s=>s.replace('.L','').startsWith(q)||s.replace('.L','').includes(q)).slice(0,10);
   if(!matches.length){dropdown.style.display='none';return}
-  dropdown.innerHTML = matches.map(s=>`<div class="search-item" onclick="selectSearch('${s}')">${s}</div>`).join('');
+  dropdown.innerHTML = matches.map(s=>{
+    const label = s.replace('.L','');
+    const mkt = isUK(s) ? `<span style="font-size:10px;color:#818cf8;margin-left:6px">${UK_INDEX_MAP[s]||'LSE'}</span>` : `<span style="font-size:10px;color:#10b981;margin-left:6px">US</span>`;
+    return `<div class="search-item" onclick="selectSearch('${s}')" style="display:flex;align-items:center;justify-content:space-between">${label}${mkt}</div>`;
+  }).join('');
   dropdown.style.display='block';
 });
 
@@ -1418,11 +1568,11 @@ startClock();
 if (state.apiKey) {
   // Silently pre-load all prices on page open so Overview is live immediately
   (async () => {
-    const quotes = await fetchBatchQuotes(SYMBOLS);
+    const quotes = await fetchBatchQuotes(ALL_SYMBOLS);
     if (quotes.length) {
       const map = {};
       quotes.forEach(q => { map[q.symbol] = q; });
-      state.marketData = SYMBOLS.map(sym => {
+      state.marketData = ALL_SYMBOLS.map(sym => {
         const q = map[sym] || {};
         const base = mockStock(sym);
         const merged = {
