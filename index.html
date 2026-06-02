@@ -164,6 +164,14 @@ select:focus,input[type=text]:focus{border-color:#6366f1}
 .field-note{font-size:12px;color:#64748b;margin-top:5px}
 .status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
 @keyframes slideIn{from{transform:translateX(40px);opacity:0}to{transform:translateX(0);opacity:1}}
+@keyframes flashUp{0%{background:rgba(16,185,129,.3)}100%{background:transparent}}
+@keyframes flashDown{0%{background:rgba(239,68,68,.3)}100%{background:transparent}}
+.flash-up{animation:flashUp .8s ease}
+.flash-down{animation:flashDown .8s ease}
+.live-badge{display:inline-flex;align-items:center;gap:5px;background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.3);color:#10b981;border-radius:20px;padding:2px 10px;font-size:11px;font-weight:600}
+.closed-badge{display:inline-flex;align-items:center;gap:5px;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.3);color:#f59e0b;border-radius:20px;padding:2px 10px;font-size:11px;font-weight:600}
+.refresh-btn{background:none;border:1px solid #2d3148;color:#64748b;border-radius:6px;padding:3px 8px;font-size:11px;cursor:pointer;transition:all .15s}
+.refresh-btn:hover{border-color:#6366f1;color:#6366f1}
 </style>
 </head>
 <body>
@@ -199,13 +207,20 @@ select:focus,input[type=text]:focus{border-color:#6366f1}
 
   <footer>
     <span>StockScreener Pro — For educational use only. Not financial advice.</span>
-    <span id="dataMode">Demo data</span>
+    <span style="display:flex;align-items:center;gap:10px">
+      <span id="marketStatus"></span>
+      <span id="lastUpdated" style="color:#475569;font-size:12px"></span>
+      <span id="dataMode">Demo data</span>
+    </span>
   </footer>
 </div>
 
 <script>
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const FMP = 'https://financialmodelingprep.com/api/v3';
+const PRICE_REFRESH_MS    = 60_000;   // refresh all prices every 60 s
+const ANALYSIS_REFRESH_MS = 30_000;   // refresh open stock quote every 30 s
+const FUND_CACHE_MS       = 600_000;  // cache fundamentals for 10 min
 const SYMBOLS = ['AAPL','MSFT','GOOGL','AMZN','NVDA','META','TSLA','BRK-B','JPM','JNJ',
   'V','PG','UNH','MA','HD','CVX','MRK','ABBV','PEP','KO',
   'AVGO','COST','LLY','TMO','MCD','DIS','ACN','DHR','NEE','IBM',
@@ -237,6 +252,13 @@ const state = {
   radarObj: null,
   screenerSort: {by:'score',dir:'desc'},
   screenerFilter: {sector:'',minScore:0},
+  // auto-refresh
+  priceTimer: null,
+  analysisTimer: null,
+  clockTimer: null,
+  lastRefresh: null,
+  // fundamentals cache: { [symbol]: { data, ts } }
+  fundCache: {},
 };
 
 // ─── MOCK DATA ────────────────────────────────────────────────────────────────
@@ -433,6 +455,9 @@ function setTab(tab) {
   document.querySelectorAll('.nav-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.tab === tab);
   });
+  // Start analysis refresh only when on analysis tab
+  if (tab === 'analysis') startAnalysisRefresh();
+  else stopAnalysisRefresh();
   render();
 }
 
@@ -475,20 +500,20 @@ function renderOverview(main) {
   }).join('');
 
   function tableRows(arr) {
-    return arr.map(s=>`<tr onclick="analyzeStock('${s.symbol}')" style="cursor:pointer">
+    return arr.map(s=>`<tr onclick="analyzeStock('${s.symbol}')" style="cursor:pointer" data-price-sym="${s.symbol}">
       <td class="sym">${s.symbol}</td>
-      <td>${fP(s.price)}</td>
-      <td class="${s.changePercent>=0?'up':'down'}">${s.changePercent>=0?'+':''}${fPct(s.changePercent)}</td>
+      <td><span data-field="price" data-prev="${s.price}">${fP(s.price)}</span></td>
+      <td><span data-field="change" class="${s.changePercent>=0?'up':'down'}">${s.changePercent>=0?'+':''}${fPct(s.changePercent)}</span></td>
       <td style="color:#94a3b8">${fBig(s.marketCap)}</td>
       <td style="color:#94a3b8">${fVol(s.volume)}</td>
     </tr>`).join('');
   }
 
   const gridCards = state.marketData.map(s=>`
-    <div class="stock-card" onclick="analyzeStock('${s.symbol}')">
+    <div class="stock-card" onclick="analyzeStock('${s.symbol}')" data-price-sym="${s.symbol}">
       <div class="sym" style="font-size:14px">${s.symbol}</div>
-      <div style="font-weight:700;margin:4px 0">${fP(s.price)}</div>
-      <div class="${s.changePercent>=0?'up':'down'}" style="font-size:12px">${s.changePercent>=0?'+':''}${fPct(s.changePercent)}</div>
+      <div style="font-weight:700;margin:4px 0"><span data-field="price" data-prev="${s.price}">${fP(s.price)}</span></div>
+      <div style="font-size:12px"><span data-field="change" class="${s.changePercent>=0?'up':'down'}">${s.changePercent>=0?'+':''}${fPct(s.changePercent)}</span></div>
       <div style="display:flex;align-items:center;gap:4px;margin-top:8px">
         <span style="font-size:11px;color:#64748b">Score</span>
         <span style="font-size:12px;font-weight:700" class="${scoreClass(s.scores.overall)}">${s.scores.overall}</span>
@@ -497,6 +522,13 @@ function renderOverview(main) {
     </div>`).join('');
 
   main.innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+      <div>
+        <span style="font-size:20px;font-weight:700">Market Overview</span>
+        ${state.apiKey ? `<span style="font-size:12px;color:#64748b;margin-left:10px">Prices refresh every 60s</span>` : `<span style="font-size:12px;color:#f59e0b;margin-left:10px">Demo data — add API key in Settings for live prices</span>`}
+      </div>
+      <button class="refresh-btn" onclick="manualRefresh()">↻ Refresh now</button>
+    </div>
     <div style="margin-bottom:20px">
       <div class="section-title">Market Indices</div>
       <div class="grid6">${idxHTML}</div>
@@ -575,6 +607,8 @@ function renderScreener(main) {
         ${state.screenerSort.dir==='desc'?'↓ Desc':'↑ Asc'}
       </button>
       <span style="font-size:13px;color:#64748b">${data.length} stocks</span>
+      <button class="refresh-btn" onclick="manualRefresh()">↻ Refresh</button>
+      ${state.lastRefresh ? `<span style="font-size:11px;color:#64748b">Updated ${Math.round((Date.now()-state.lastRefresh)/1000)}s ago</span>` : ''}
     </div>
     <div class="card table-wrap">
       <table>
@@ -709,9 +743,12 @@ function renderAnalysis(container) {
             <div style="margin-top:4px"><span class="badge badge-blue">${s.sector}</span></div>
           </div>
         </div>
-        <div style="text-align:right">
+        <div style="text-align:right" id="analysisPriceBlock">
           <div class="price-big">${fP(s.price)}</div>
           <div class="change-big ${up?'up':'down'}">${up?'+':''}${fPct(s.changePercent)} &nbsp;(${up?'+':''}${fP(s.change)})</div>
+          <div style="font-size:11px;color:#64748b;margin-top:4px">
+            ${state.apiKey ? `Vol: ${fVol(s.volume)} &nbsp;·&nbsp; Auto-refreshing every 30s` : 'Demo data'}
+          </div>
         </div>
       </div>
     </div>
@@ -835,6 +872,224 @@ async function apiFetch(path) {
   return r.json();
 }
 
+// Single request for ALL symbols — the key to staying within free API limits
+async function fetchBatchQuotes(symbols) {
+  try {
+    const data = await apiFetch(`/quote/${symbols.join(',')}`);
+    return Array.isArray(data) ? data : [];
+  } catch(e) { console.warn('Batch quote fetch failed:', e.message); return []; }
+}
+
+// Fundamentals with 10-min cache so repeated analysis visits don't burn quota
+async function fetchFundamentals(sym) {
+  const cached = state.fundCache[sym];
+  if (cached && Date.now() - cached.ts < FUND_CACHE_MS) return cached.data;
+  try {
+    const [profileArr, ratiosArr, growthArr] = await Promise.all([
+      apiFetch(`/profile/${sym}`),
+      apiFetch(`/ratios-ttm/${sym}`),
+      apiFetch(`/financial-growth/${sym}?limit=1`),
+    ]);
+    const p = profileArr?.[0] || {};
+    const rat = ratiosArr?.[0] || {};
+    const gr = growthArr?.[0] || {};
+    const data = {
+      sector: p.sector, industry: p.industry, description: p.description,
+      employees: p.fullTimeEmployees, beta: p.beta, dividendYield: p.lastDiv,
+      exchange: p.exchangeShortName,
+      pb: rat.priceToBookRatioTTM,
+      ps: rat.priceToSalesRatioTTM,
+      roe: rat.returnOnEquityTTM != null ? rat.returnOnEquityTTM * 100 : null,
+      roa: rat.returnOnAssetsTTM != null ? rat.returnOnAssetsTTM * 100 : null,
+      debtToEquity: rat.debtEquityRatioTTM,
+      currentRatio: rat.currentRatioTTM,
+      quickRatio: rat.quickRatioTTM,
+      grossMargin:      rat.grossProfitMarginTTM      != null ? rat.grossProfitMarginTTM * 100 : null,
+      operatingMargin:  rat.operatingProfitMarginTTM  != null ? rat.operatingProfitMarginTTM * 100 : null,
+      netMargin:        rat.netProfitMarginTTM         != null ? rat.netProfitMarginTTM * 100 : null,
+      evToEbitda: rat.enterpriseValueMultipleTTM,
+      pfcf: rat.priceToFreeCashFlowsRatioTTM,
+      interestCoverage: rat.interestCoverageTTM,
+      freeCashFlow: rat.freeCashFlowPerShareTTM,
+      revenueGrowth:  gr.revenueGrowth  != null ? gr.revenueGrowth * 100  : null,
+      earningsGrowth: gr.netIncomeGrowth != null ? gr.netIncomeGrowth * 100 : null,
+    };
+    state.fundCache[sym] = { data, ts: Date.now() };
+    return data;
+  } catch(e) { console.warn('Fundamentals fetch failed:', e.message); return {}; }
+}
+
+async function fetchLiveHistory(sym, days) {
+  try {
+    const from = new Date(Date.now() - days * 86400000).toISOString().slice(0,10);
+    const data = await apiFetch(`/historical-price-full/${sym}?from=${from}`);
+    const hist = (data?.historical || []).reverse();
+    if (!hist.length) throw new Error('empty');
+    return hist.map(h => ({ date: h.date, close: h.close }));
+  } catch(e) { console.warn('History fetch failed:', e.message); return null; }
+}
+
+// ─── MARKET STATUS ────────────────────────────────────────────────────────────
+function isMarketOpen() {
+  const now = new Date();
+  // Convert to US Eastern time
+  const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const day = et.getDay(); // 0=Sun, 6=Sat
+  const h = et.getHours(), m = et.getMinutes();
+  const mins = h * 60 + m;
+  if (day === 0 || day === 6) return false;
+  return mins >= 570 && mins < 960; // 9:30am–4:00pm ET
+}
+
+function updateMarketStatus() {
+  const el = document.getElementById('marketStatus');
+  if (!el) return;
+  if (isMarketOpen()) {
+    el.innerHTML = `<span class="live-badge"><span style="width:6px;height:6px;border-radius:50%;background:#10b981;animation:pulse 1.5s infinite;display:inline-block"></span>Market Open</span>`;
+  } else {
+    el.innerHTML = `<span class="closed-badge">Market Closed</span>`;
+  }
+}
+
+// ─── AUTO-REFRESH ENGINE ──────────────────────────────────────────────────────
+function startPriceRefresh() {
+  stopPriceRefresh();
+  if (!state.apiKey) return;
+  // Run immediately then on interval
+  refreshAllPrices();
+  state.priceTimer = setInterval(refreshAllPrices, PRICE_REFRESH_MS);
+}
+
+function stopPriceRefresh() {
+  if (state.priceTimer) { clearInterval(state.priceTimer); state.priceTimer = null; }
+}
+
+function startAnalysisRefresh() {
+  stopAnalysisRefresh();
+  if (!state.apiKey || !state.selectedSymbol) return;
+  state.analysisTimer = setInterval(refreshAnalysisQuote, ANALYSIS_REFRESH_MS);
+}
+
+function stopAnalysisRefresh() {
+  if (state.analysisTimer) { clearInterval(state.analysisTimer); state.analysisTimer = null; }
+}
+
+function startClock() {
+  if (state.clockTimer) clearInterval(state.clockTimer);
+  state.clockTimer = setInterval(() => {
+    updateLastUpdatedText();
+    updateMarketStatus();
+  }, 5000);
+}
+
+async function refreshAllPrices() {
+  if (!state.apiKey) return;
+  try {
+    const quotes = await fetchBatchQuotes(SYMBOLS);
+    if (!quotes.length) return;
+    state.lastRefresh = Date.now();
+
+    // Build a quick lookup map
+    const map = {};
+    quotes.forEach(q => { map[q.symbol] = q; });
+
+    // Update market data — track previous price for flash
+    state.marketData = state.marketData.map(s => {
+      const q = map[s.symbol];
+      if (!q) return s;
+      const prevPrice = s.price;
+      return { ...s, price: q.price, change: q.change, changePercent: q.changesPercentage,
+               volume: q.volume, marketCap: q.marketCap,
+               _flash: q.price > prevPrice ? 'up' : q.price < prevPrice ? 'down' : null };
+    });
+
+    // Update screener data
+    state.screenerData = state.screenerData.map(s => {
+      const q = map[s.symbol];
+      if (!q) return s;
+      return { ...s, price: q.price, change: q.change, changePercent: q.changesPercentage,
+               volume: q.volume, marketCap: q.marketCap };
+    });
+
+    // Update open analysis stock price in-place (no full reload)
+    if (state.selectedStock && map[state.selectedStock.symbol]) {
+      const q = map[state.selectedStock.symbol];
+      const prevPrice = state.selectedStock.price;
+      state.selectedStock = { ...state.selectedStock, price: q.price, change: q.change,
+                               changePercent: q.changesPercentage, volume: q.volume,
+                               _flash: q.price > prevPrice ? 'up' : q.price < prevPrice ? 'down' : null };
+    }
+
+    updatePricesInDOM(map);
+    updateLastUpdatedText();
+    console.log(`[AutoRefresh] Prices updated at ${new Date().toLocaleTimeString()}`);
+  } catch(e) { console.warn('refreshAllPrices failed:', e.message); }
+}
+
+async function refreshAnalysisQuote() {
+  if (!state.apiKey || !state.selectedSymbol) return;
+  try {
+    const quotes = await fetchBatchQuotes([state.selectedSymbol]);
+    const q = quotes[0];
+    if (!q) return;
+    const prevPrice = state.selectedStock?.price;
+    state.selectedStock = { ...state.selectedStock, price: q.price, change: q.change,
+                             changePercent: q.changesPercentage, volume: q.volume,
+                             _flash: q.price > prevPrice ? 'up' : q.price < prevPrice ? 'down' : null };
+    state.lastRefresh = Date.now();
+    // Only patch the price display, don't blow away the whole analysis page
+    patchAnalysisPriceHeader(q, prevPrice);
+    updateLastUpdatedText();
+  } catch(e) { console.warn('refreshAnalysisQuote failed:', e.message); }
+}
+
+// ─── DOM PATCHING (update prices without re-rendering entire page) ─────────────
+function updatePricesInDOM(quoteMap) {
+  // Patch any [data-price-sym] elements currently in the DOM
+  document.querySelectorAll('[data-price-sym]').forEach(el => {
+    const sym = el.dataset.priceSym;
+    const q = quoteMap[sym];
+    if (!q) return;
+    const up = q.changesPercentage >= 0;
+
+    const priceEl  = el.querySelector('[data-field="price"]');
+    const changeEl = el.querySelector('[data-field="change"]');
+
+    if (priceEl) {
+      const prev = parseFloat(priceEl.dataset.prev || q.price);
+      const flash = q.price > prev ? 'flash-up' : q.price < prev ? 'flash-down' : null;
+      priceEl.textContent = fP(q.price);
+      priceEl.dataset.prev = q.price;
+      if (flash) { priceEl.classList.remove('flash-up','flash-down'); void priceEl.offsetWidth; priceEl.classList.add(flash); }
+    }
+    if (changeEl) {
+      changeEl.textContent = (up?'+':'') + fPct(q.changesPercentage);
+      changeEl.className = up ? 'up' : 'down';
+    }
+  });
+}
+
+function patchAnalysisPriceHeader(q, prevPrice) {
+  const el = document.getElementById('analysisPriceBlock');
+  if (!el) return;
+  const up = q.changesPercentage >= 0;
+  const flash = q.price > prevPrice ? 'flash-up' : q.price < prevPrice ? 'flash-down' : null;
+  el.innerHTML = `
+    <div class="price-big" id="livePrice" style="transition:color .3s">${fP(q.price)}</div>
+    <div class="change-big ${up?'up':'down'}">${up?'+':''}${fPct(q.changesPercentage)} &nbsp;(${up?'+':''}${fP(q.change)})</div>
+    <div style="font-size:11px;color:#64748b;margin-top:4px">Vol: ${fVol(q.volume)} &nbsp;·&nbsp; Updated ${new Date().toLocaleTimeString()}</div>`;
+  if (flash) { el.classList.remove('flash-up','flash-down'); void el.offsetWidth; el.classList.add(flash); }
+}
+
+function updateLastUpdatedText() {
+  const el = document.getElementById('lastUpdated');
+  if (!el || !state.lastRefresh) return;
+  const secs = Math.round((Date.now() - state.lastRefresh) / 1000);
+  if (secs < 5)  el.textContent = 'Just updated';
+  else if (secs < 60) el.textContent = `Updated ${secs}s ago`;
+  else el.textContent = `Updated ${Math.floor(secs/60)}m ago`;
+}
+
 async function fetchLiveStock(sym) {
   try {
     const [quoteArr, profileArr, ratiosArr, growthArr] = await Promise.all([
@@ -943,36 +1198,63 @@ window.analyzeStock = async function(sym) {
   sym = sym.toUpperCase().trim();
   state.selectedSymbol = sym;
   state.analysisTab = 'overview';
-
-  const analysisTabBtn = document.getElementById('analysisTab');
   document.getElementById('analysisLabel').textContent = sym;
-  analysisTabBtn.style.display = '';
+  document.getElementById('analysisTab').style.display = '';
 
-  // Show loading state immediately
+  // Show loading spinner immediately
   state.selectedStock = null;
   state.selectedHistory = null;
+  stopAnalysisRefresh();
   setTab('analysis');
 
-  let d;
+  let quote = null, fundamentals = {};
+
   if (state.apiKey) {
     showToast(`Fetching live data for ${sym}…`, 'info');
-    d = await fetchLiveStock(sym);
+    // Fetch quote + fundamentals in parallel
+    const [quotes, funds] = await Promise.all([
+      fetchBatchQuotes([sym]),
+      fetchFundamentals(sym),
+    ]);
+    quote = quotes[0] || null;
+    fundamentals = funds;
   }
 
-  // Fall back to demo if no key or fetch failed
-  if (!d) d = mockStock(sym);
+  let d;
+  if (quote) {
+    d = {
+      symbol:        quote.symbol,
+      name:          quote.name,
+      price:         quote.price,
+      change:        quote.change,
+      changePercent: quote.changesPercentage,
+      marketCap:     quote.marketCap,
+      volume:        quote.volume,
+      pe:            quote.pe,
+      eps:           quote.eps,
+      week52High:    quote.yearHigh,
+      week52Low:     quote.yearLow,
+      exchange:      quote.exchange,
+      ...fundamentals,
+    };
+  } else {
+    d = mockStock(sym);
+  }
 
   const {scores, details} = score(d);
   state.selectedStock = {...d, scores, details};
 
-  // Fetch history
+  // Fetch price history
   let hist = null;
   if (state.apiKey) hist = await fetchLiveHistory(sym, state.chartRange);
   state.selectedHistory = hist || mockHistory(d.price, state.chartRange);
 
-  if (state.apiKey && d.symbol) showToast(`Live data loaded for ${sym}`, 'success');
+  if (state.apiKey && quote) showToast(`Live data loaded for ${sym}`, 'success');
 
   render();
+
+  // Start 30s quote refresh for this stock
+  startAnalysisRefresh();
 };
 
 window.toggleWatchlist = function(sym) {
@@ -1007,30 +1289,66 @@ window.setAnalysisTab = function(tab) {
   if(tab==='overview'||tab==='fundamentals') setTimeout(()=>renderRadarChart(state.selectedStock?.scores),50);
 };
 
-window.setChartRange = function(days) {
+window.setChartRange = async function(days) {
   state.chartRange = days;
-  if(state.selectedStock) state.selectedHistory = mockHistory(state.selectedStock.price, days);
+  let hist = null;
+  if (state.apiKey && state.selectedSymbol) {
+    hist = await fetchLiveHistory(state.selectedSymbol, days);
+  }
+  state.selectedHistory = hist || mockHistory(state.selectedStock?.price || 100, days);
   render();
-  setTimeout(()=>renderPriceChart(state.selectedHistory),50);
+  setTimeout(()=>renderPriceChart(state.selectedHistory), 50);
 };
 
 window.saveApiKey = async function() {
   state.apiKey = document.getElementById('apiKeyInput').value.trim();
   localStorage.setItem('fmp_key', state.apiKey);
-  document.getElementById('dataMode').textContent = state.apiKey ? 'Live data (FMP)' : 'Demo data';
+  updateDataModeLabel();
+
   if (state.apiKey) {
-    showToast('API key saved — loading live screener data…', 'info');
-    // Reload screener with live data
-    state.screenerData = [];
-    const live = await fetchLiveScreener();
-    if (live) {
-      state.screenerData = live.map(d => { const {scores} = score(d); return {...d, scores}; });
-      showToast('Live screener data loaded ✓', 'success');
+    showToast('API key saved — fetching live data…', 'info');
+    // Load initial batch of prices for overview + screener
+    const quotes = await fetchBatchQuotes(SYMBOLS);
+    if (quotes.length) {
+      const map = {};
+      quotes.forEach(q => { map[q.symbol] = q; });
+      state.marketData = SYMBOLS.map(sym => {
+        const q = map[sym] || {};
+        const base = mockStock(sym);
+        const merged = { ...base,
+          price: q.price ?? base.price, change: q.change ?? base.change,
+          changePercent: q.changesPercentage ?? base.changePercent,
+          marketCap: q.marketCap ?? base.marketCap, volume: q.volume ?? base.volume,
+          pe: q.pe ?? base.pe, eps: q.eps ?? base.eps,
+          week52High: q.yearHigh ?? base.week52High, week52Low: q.yearLow ?? base.week52Low,
+          name: q.name ?? base.name, exchange: q.exchange ?? base.exchange,
+        };
+        const {scores} = score(merged);
+        return {...merged, scores};
+      });
+      state.screenerData = [...state.marketData];
+      state.lastRefresh = Date.now();
+      showToast(`Live prices loaded for ${quotes.length} stocks ✓`, 'success');
     } else {
-      showToast('Could not reach API — check your key', 'error');
+      showToast('API key may be invalid — check and try again', 'error');
     }
+    startPriceRefresh();
+  } else {
+    stopPriceRefresh();
+    state.marketData = [];
+    state.screenerData = [];
   }
+
   render();
+  updateLastUpdatedText();
+  updateMarketStatus();
+};
+
+window.manualRefresh = async function() {
+  if (!state.apiKey) { showToast('Add an API key in Settings first', 'info'); return; }
+  showToast('Refreshing prices…', 'info');
+  await refreshAllPrices();
+  if (state.tab === 'overview' || state.tab === 'screener') render();
 };
 
 // ─── SEARCH ──────────────────────────────────────────────────────────────────
@@ -1086,8 +1404,48 @@ function showToast(msg, type='info') {
   setTimeout(() => { toast.style.opacity='0'; toast.style.transition='opacity .3s'; setTimeout(()=>toast.remove(), 300); }, 3500);
 }
 
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+function updateDataModeLabel() {
+  const el = document.getElementById('dataMode');
+  if (el) el.textContent = state.apiKey ? '● Live data (FMP)' : '○ Demo data';
+}
+
 // ─── INIT ─────────────────────────────────────────────────────────────────────
-document.getElementById('dataMode').textContent = state.apiKey ? 'Live data (FMP)' : 'Demo data';
+updateDataModeLabel();
+updateMarketStatus();
+startClock();
+
+if (state.apiKey) {
+  // Silently pre-load all prices on page open so Overview is live immediately
+  (async () => {
+    const quotes = await fetchBatchQuotes(SYMBOLS);
+    if (quotes.length) {
+      const map = {};
+      quotes.forEach(q => { map[q.symbol] = q; });
+      state.marketData = SYMBOLS.map(sym => {
+        const q = map[sym] || {};
+        const base = mockStock(sym);
+        const merged = {
+          ...base,
+          price: q.price ?? base.price, change: q.change ?? base.change,
+          changePercent: q.changesPercentage ?? base.changePercent,
+          marketCap: q.marketCap ?? base.marketCap, volume: q.volume ?? base.volume,
+          pe: q.pe ?? base.pe, eps: q.eps ?? base.eps,
+          week52High: q.yearHigh ?? base.week52High, week52Low: q.yearLow ?? base.week52Low,
+          name: q.name ?? base.name, exchange: q.exchange ?? base.exchange,
+        };
+        const {scores} = score(merged);
+        return {...merged, scores};
+      });
+      state.screenerData = [...state.marketData];
+      state.lastRefresh = Date.now();
+      render();
+      updateLastUpdatedText();
+    }
+  })();
+  startPriceRefresh();
+}
+
 render();
 </script>
 </body>
