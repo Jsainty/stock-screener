@@ -250,8 +250,9 @@ select:focus,input[type=text]:focus{border-color:#6366f1}
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const TD  = 'https://api.twelvedata.com';   // Twelve Data — prices & history (free tier, CORS ok)
 const FMP = 'https://financialmodelingprep.com/api/v3'; // FMP — fundamentals only (optional)
-const PRICE_REFRESH_MS    = 120_000;  // 2 min — keeps well under TD 8 req/min free limit
-const ANALYSIS_REFRESH_MS = 60_000;   // 1 min
+const TD_BATCH_SIZE       = 8;        // TD free tier: 8 credits/min, 1 credit = 1 symbol
+const PRICE_REFRESH_MS    = 65_000;   // 65s between batches — 1 batch of 8 per minute
+const ANALYSIS_REFRESH_MS = 65_000;
 const FUND_CACHE_MS       = 600_000;
 const NEWS_CACHE_MS       = 300_000;
 // US symbols
@@ -316,6 +317,7 @@ const state = {
   analysisTimer: null,
   clockTimer: null,
   lastRefresh: null,
+  priceBatchIndex: 0,   // which batch of 8 symbols to fetch next
   // fundamentals cache: { [symbol]: { data, ts } }
   fundCache: {},
   // news cache: { [key]: { data, ts } }
@@ -1570,9 +1572,9 @@ function updateMarketStatus() {
 // ─── AUTO-REFRESH ENGINE ──────────────────────────────────────────────────────
 function startPriceRefresh() {
   stopPriceRefresh();
-  if (!state.apiKey) return;
-  // Run immediately then on interval
-  refreshAllPrices();
+  if (!state.tdApiKey) return;
+  // Don't fire immediately — loadLiveMarketData already fetched batch 0
+  // Start at batch 1, fire every 65s (= 8 credits/65s = well within 8/min limit)
   state.priceTimer = setInterval(refreshAllPrices, PRICE_REFRESH_MS);
 }
 
@@ -1580,15 +1582,9 @@ function stopPriceRefresh() {
   if (state.priceTimer) { clearInterval(state.priceTimer); state.priceTimer = null; }
 }
 
-function startAnalysisRefresh() {
-  stopAnalysisRefresh();
-  if (!state.apiKey || !state.selectedSymbol) return;
-  state.analysisTimer = setInterval(refreshAnalysisQuote, ANALYSIS_REFRESH_MS);
-}
-
-function stopAnalysisRefresh() {
-  if (state.analysisTimer) { clearInterval(state.analysisTimer); state.analysisTimer = null; }
-}
+// Analysis refresh is handled by the single priceTimer — no separate timer needed
+function startAnalysisRefresh() { /* handled by priceTimer */ }
+function stopAnalysisRefresh()  { /* no-op */ }
 
 function startClock() {
   if (state.clockTimer) clearInterval(state.clockTimer);
@@ -1617,45 +1613,45 @@ function applyQuotePatch(existing, q) {
   };
 }
 
+// Single timer handler — smartly uses the 1 allowed request per 65s
+// On analysis tab: refresh that specific stock (most important to user)
+// On any other tab: rotate through all symbols 8 at a time
 async function refreshAllPrices() {
-  if (!state.apiKey) return;
+  if (!state.tdApiKey) return;
   try {
-    const quotes = await fetchBatchQuotes(ALL_SYMBOLS);
-    if (!quotes.length) return;
-    state.lastRefresh = Date.now();
-
-    const map = {};
-    quotes.forEach(q => { if (q.symbol) map[q.symbol] = q; });
-
-    // Patch price fields only — fundamentals already loaded stay intact
-    state.marketData  = state.marketData.map(s  => applyQuotePatch(s, map[s.symbol]));
-    state.screenerData = state.screenerData.map(s => applyQuotePatch(s, map[s.symbol]));
-
-    if (state.selectedStock && map[state.selectedStock.symbol]) {
-      state.selectedStock = applyQuotePatch(state.selectedStock, map[state.selectedStock.symbol]);
+    if (state.tab === 'analysis' && state.selectedSymbol) {
+      // Refresh only the open stock — 1 credit, fast price update
+      const data   = await tdFetch(`/quote?symbol=${toTDSym(state.selectedSymbol)}&dp=2`);
+      const quotes = parseTDQuotes(data);
+      const q      = quotes[0];
+      if (q && state.selectedStock) {
+        const prev      = state.selectedStock.price;
+        state.selectedStock = applyQuotePatch(state.selectedStock, q);
+        patchAnalysisPriceHeader(q, prev);
+      }
+    } else {
+      // Rotate through all symbols 8 at a time — 8 credits, covers full list over time
+      const ordered = buildPrioritySymbols();
+      const batches = chunkArray(ordered, TD_BATCH_SIZE);
+      const idx     = state.priceBatchIndex % batches.length;
+      state.priceBatchIndex++;
+      const tdSyms  = batches[idx].map(toTDSym).join(',');
+      const data    = await tdFetch(`/quote?symbol=${tdSyms}&dp=2`);
+      const quotes  = parseTDQuotes(data);
+      applyBatchToState(quotes);
+      const done = Math.min((idx + 1) * TD_BATCH_SIZE, ordered.length);
+      const lu = document.getElementById('lastUpdated');
+      if (lu) lu.textContent = `Live: ${done}/${ordered.length} stocks · refreshing every 65s`;
     }
-
-    updatePricesInDOM(map);
-    updateLastUpdatedText();
-  } catch(e) { console.warn('refreshAllPrices failed:', e.message); }
-}
-
-async function refreshAnalysisQuote() {
-  if (!state.apiKey || !state.selectedSymbol) return;
-  try {
-    const quotes = await fetchBatchQuotes([state.selectedSymbol]);
-    const q = quotes[0];
-    if (!q) return;
-    const prevPrice = state.selectedStock?.price;
-    state.selectedStock = { ...state.selectedStock, price: q.price, change: q.change,
-                             changePercent: q.changesPercentage, volume: q.volume,
-                             _flash: q.price > prevPrice ? 'up' : q.price < prevPrice ? 'down' : null };
     state.lastRefresh = Date.now();
-    // Only patch the price display, don't blow away the whole analysis page
-    patchAnalysisPriceHeader(q, prevPrice);
-    updateLastUpdatedText();
-  } catch(e) { console.warn('refreshAnalysisQuote failed:', e.message); }
+  } catch(e) {
+    if (e.message?.includes('429')) showToast('Rate limit — will resume automatically in 65s', 'info');
+    console.warn('Price refresh failed:', e.message);
+  }
 }
+
+// Kept for compatibility — handled by the single priceTimer now
+async function refreshAnalysisQuote() { await refreshAllPrices(); }
 
 // ─── DOM PATCHING (update prices without re-rendering entire page) ─────────────
 function updatePricesInDOM(quoteMap) {
@@ -1965,67 +1961,75 @@ window.setChartRange = async function(days) {
 };
 
 // Shared helper — build market data from live quotes + profiles, no mock fundamentals
+// Build ordered symbol list — watchlist first (user cares most), then the rest
+function buildPrioritySymbols() {
+  const wl = new Set(state.watchlist);
+  const prioritised = [
+    ...ALL_SYMBOLS.filter(s => wl.has(s)),
+    ...ALL_SYMBOLS.filter(s => !wl.has(s)),
+  ];
+  return prioritised;
+}
+
+// Apply one batch of live quotes into marketData / screenerData
+function applyBatchToState(quotes) {
+  if (!quotes.length) return;
+  const map = {};
+  quotes.forEach(q => { if (q.symbol) map[q.symbol] = q; });
+  state.marketData   = state.marketData.map(s   => applyQuotePatch(s, map[s.symbol]));
+  state.screenerData = state.screenerData.map(s  => applyQuotePatch(s, map[s.symbol]));
+  if (state.selectedStock && map[state.selectedStock.symbol])
+    state.selectedStock = applyQuotePatch(state.selectedStock, map[state.selectedStock.symbol]);
+  state.lastRefresh = Date.now();
+  updatePricesInDOM(map);
+  updateLastUpdatedText();
+}
+
 async function loadLiveMarketData(showToasts = false) {
   if (!state.tdApiKey) {
-    if (showToasts) showToast('Add a Twelve Data API key in Settings to load live data', 'info');
+    if (showToasts) showToast('Add a Twelve Data key in Settings', 'info');
     return false;
   }
 
-  if (showToasts) showToast('Validating Twelve Data key…', 'info');
-
-  const validation = await validateTdKey();
-  if (!validation.ok) {
-    const msg = validation.message || 'Unknown error';
-    if (showToasts) showToast(`Twelve Data error: ${msg}`, 'error');
-    return false;
+  // Seed market data from mock so the UI shows something immediately
+  if (!state.marketData.length) {
+    state.marketData   = ALL_SYMBOLS.map(s => { const d=mockStock(s); const {scores}=score(d); return {...d,scores}; });
+    state.screenerData = [...state.marketData];
   }
 
-  if (showToasts) showToast('Key valid — loading live prices…', 'info');
+  if (showToasts) showToast('Fetching first 8 prices…', 'info');
 
-  // Prices from TD (1 request), profiles from FMP only if key exists
-  const [quotes, profiles] = await Promise.all([
-    fetchBatchQuotes(ALL_SYMBOLS),
-    state.apiKey ? fetchBatchProfiles(ALL_SYMBOLS) : Promise.resolve({}),
-  ]);
+  // Fetch ONLY the first batch of 8 — this is the validation AND initial data in one call
+  const ordered = buildPrioritySymbols();
+  const firstBatch = ordered.slice(0, TD_BATCH_SIZE);
+  try {
+    const tdSyms = firstBatch.map(toTDSym).join(',');
+    const data   = await tdFetch(`/quote?symbol=${tdSyms}&dp=2`);
+    const quotes = parseTDQuotes(data);
 
-  if (!quotes.length) {
-    if (showToasts) showToast('Prices loaded 0 stocks — check console for details', 'error');
+    if (!quotes.length) {
+      if (showToasts) showToast('No data returned — check your API key', 'error');
+      return false;
+    }
+
+    applyBatchToState(quotes);
+    state.priceBatchIndex = 1; // next rotation starts at batch 1
+
+    const total  = ALL_SYMBOLS.length;
+    const loaded = quotes.length;
+    if (showToasts) showToast(
+      loaded === TD_BATCH_SIZE
+        ? `${loaded}/${total} stocks live ✓ — loading rest every 65s`
+        : `Partial load (${loaded} stocks) — more in 65s`,
+      'success'
+    );
+    return true;
+  } catch(e) {
+    const msg = e.message || 'Unknown error';
+    if (showToasts) showToast(`API error: ${msg}`, 'error');
+    console.error('loadLiveMarketData failed:', msg);
     return false;
   }
-
-  const quoteMap = {};
-  quotes.forEach(q => { if (q.symbol) quoteMap[q.symbol] = q; });
-
-  state.marketData = ALL_SYMBOLS
-    .filter(sym => quoteMap[sym])          // only symbols FMP returned data for
-    .map(sym => {
-      const entry   = quoteToMarketEntry(quoteMap[sym]);
-      const profile = profiles[sym] || {};
-
-      // Merge profile data (sector, description, beta, dividendYield)
-      entry.sector      = profile.sector      || null;
-      entry.industry    = profile.industry    || null;
-      entry.description = profile.description || null;
-      entry.employees   = profile.employees   || null;
-      entry.beta        = profile.beta        || null;
-      entry.name        = profile.name || entry.name;
-      // dividendYield from profile: lastDiv is per-share amount, convert to yield %
-      if (profile._lastDiv && entry.price) {
-        entry.dividendYield = (profile._lastDiv / entry.price) * 100;
-      }
-      if (entry.exchange === '' && profile.exchange) entry.exchange = profile.exchange;
-
-      const { scores } = score(entry);
-      entry.scores = scores;
-      return entry;
-    });
-
-  // Symbols FMP didn't return (delisted, invalid) — exclude silently
-  state.screenerData  = [...state.marketData];
-  state.lastRefresh   = Date.now();
-
-  if (showToasts) showToast(`Live data loaded for ${state.marketData.length} stocks ✓`, 'success');
-  return true;
 }
 
 // Save Twelve Data key (prices)
