@@ -983,10 +983,20 @@ function renderSettings(main) {
         <input type="text" id="apiKeyInput" value="${state.apiKey}" placeholder="Paste your free API key…"/>
         <div class="field-note">Get a free key at <strong>financialmodelingprep.com</strong> (250 requests/day). Without a key, realistic demo data is used.</div>
       </div>
-      <button class="btn btn-primary" onclick="saveApiKey()">Save Key</button>
-      <div style="margin-top:12px;font-size:13px">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+        <button class="btn btn-primary" onclick="saveApiKey()">Save & Load Data</button>
+        <button class="btn btn-ghost" onclick="testApiKey()">Test Key</button>
+      </div>
+      <div id="apiKeyStatus" style="font-size:13px">
         <span class="status-dot" style="background:${hasKey?'#10b981':'#f59e0b'}"></span>
-        ${hasKey?'<span style="color:#10b981">API key active — live data enabled</span>':'<span style="color:#f59e0b">Using demo data (no API key)</span>'}
+        ${hasKey?'<span style="color:#10b981">API key saved — live data active</span>':'<span style="color:#f59e0b">No API key — using demo data</span>'}
+      </div>
+      <div style="margin-top:12px;font-size:12px;color:#64748b;line-height:1.6">
+        <strong style="color:#94a3b8">How to get a free key:</strong><br>
+        1. Go to <strong style="color:#818cf8">financialmodelingprep.com/register</strong><br>
+        2. Sign up and confirm your email<br>
+        3. Copy your key from the dashboard and paste it above<br>
+        4. Click <strong>Save & Load Data</strong>
       </div>
     </div>
 
@@ -1225,14 +1235,42 @@ async function apiFetch(path) {
   const url = `${FMP}${path}${path.includes('?')?'&':'?'}apikey=${state.apiKey}`;
   const r = await fetch(url);
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return r.json();
+  const json = await r.json();
+  // FMP returns errors as objects, not HTTP error codes
+  if (json && typeof json === 'object' && !Array.isArray(json)) {
+    const msg = json['Error Message'] || json.message || json.error;
+    if (msg) throw new Error(msg);
+  }
+  return json;
 }
 
-// Single request for ALL symbols — the key to staying within free API limits
+// Validate key with a single known symbol before doing bulk requests
+async function validateApiKey() {
+  try {
+    const data = await apiFetch('/quote/AAPL');
+    return { ok: true };
+  } catch(e) {
+    return { ok: false, message: e.message };
+  }
+}
+
+// Chunk symbols into groups so URLs stay short — FMP handles ~15-20 at a time reliably
+function chunkArray(arr, size) {
+  const chunks = [];
+  for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
+  return chunks;
+}
+
+// Fetch quotes in chunks of 15, merge results
 async function fetchBatchQuotes(symbols) {
   try {
-    const data = await apiFetch(`/quote/${symbols.join(',')}`);
-    return Array.isArray(data) ? data : [];
+    const chunks = chunkArray(symbols, 15);
+    const results = await Promise.allSettled(
+      chunks.map(chunk => apiFetch(`/quote/${chunk.join(',')}`))
+    );
+    return results
+      .filter(r => r.status === 'fulfilled' && Array.isArray(r.value))
+      .flatMap(r => r.value);
   } catch(e) { console.warn('Batch quote fetch failed:', e.message); return []; }
 }
 
@@ -1269,22 +1307,28 @@ function quoteToMarketEntry(q) {
 // Batch-fetch profiles for many symbols in one API call to get sector/name/beta/dividend
 async function fetchBatchProfiles(symbols) {
   try {
-    const data = await apiFetch(`/profile/${symbols.join(',')}`);
-    if (!Array.isArray(data)) return {};
+    // Chunk profiles too — large URLs are unreliable
+    const chunks = chunkArray(symbols, 15);
+    const results = await Promise.allSettled(
+      chunks.map(chunk => apiFetch(`/profile/${chunk.join(',')}`))
+    );
     const map = {};
-    data.forEach(p => {
-      if (p.symbol) map[p.symbol] = {
-        sector: p.sector || null,
-        industry: p.industry || null,
-        description: p.description || null,
-        employees: p.fullTimeEmployees || null,
-        beta: p.beta || null,
-        // dividendYield from profile is annual dividend amount, not %. Calculate below.
-        _lastDiv: p.lastDiv || 0,
-        exchange: p.exchangeShortName || null,
-        name: p.companyName || null,
-      };
-    });
+    results
+      .filter(r => r.status === 'fulfilled' && Array.isArray(r.value))
+      .flatMap(r => r.value)
+      .forEach(p => {
+        if (!p.symbol) return;
+        map[p.symbol] = {
+          sector: p.sector || null,
+          industry: p.industry || null,
+          description: p.description || null,
+          employees: p.fullTimeEmployees || null,
+          beta: p.beta || null,
+          _lastDiv: p.lastDiv || 0,
+          exchange: p.exchangeShortName || null,
+          name: p.companyName || null,
+        };
+      });
     return map;
   } catch(e) { console.warn('Batch profile fetch failed:', e.message); return {}; }
 }
@@ -1826,15 +1870,27 @@ window.setChartRange = async function(days) {
 
 // Shared helper — build market data from live quotes + profiles, no mock fundamentals
 async function loadLiveMarketData(showToasts = false) {
-  if (showToasts) showToast('Fetching live prices and profiles…', 'info');
+  if (showToasts) showToast('Validating API key…', 'info');
 
+  // Step 1: validate key with a single known symbol before bulk requests
+  const validation = await validateApiKey();
+  if (!validation.ok) {
+    const msg = validation.message || 'Unknown error';
+    if (showToasts) showToast(`API key error: ${msg}`, 'error');
+    console.error('FMP API key validation failed:', msg);
+    return false;
+  }
+
+  if (showToasts) showToast('Key valid — loading prices and profiles…', 'info');
+
+  // Step 2: bulk load in chunks
   const [quotes, profiles] = await Promise.all([
     fetchBatchQuotes(ALL_SYMBOLS),
     fetchBatchProfiles(ALL_SYMBOLS),
   ]);
 
   if (!quotes.length) {
-    if (showToasts) showToast('Could not reach FMP — check your API key', 'error');
+    if (showToasts) showToast('Prices loaded 0 stocks — check console for details', 'error');
     return false;
   }
 
@@ -1894,6 +1950,30 @@ window.saveApiKey = async function() {
   render();
   updateLastUpdatedText();
   updateMarketStatus();
+};
+
+window.testApiKey = async function() {
+  const key = document.getElementById('apiKeyInput')?.value.trim();
+  if (!key) { showToast('Paste your API key first', 'info'); return; }
+
+  // Temporarily use the typed key (not yet saved) for the test
+  const prev = state.apiKey;
+  state.apiKey = key;
+
+  const statusEl = document.getElementById('apiKeyStatus');
+  if (statusEl) statusEl.innerHTML = '<span style="color:#6366f1">⏳ Testing key…</span>';
+
+  const result = await validateApiKey();
+  state.apiKey = prev; // restore — user hasn't saved yet
+
+  if (result.ok) {
+    showToast('✓ API key is valid — click Save & Load Data to activate', 'success');
+    if (statusEl) statusEl.innerHTML = '<span style="color:#10b981">✓ Key tested successfully — click Save & Load Data</span>';
+  } else {
+    const msg = result.message || 'Unknown error';
+    showToast(`✗ Key invalid: ${msg}`, 'error');
+    if (statusEl) statusEl.innerHTML = `<span style="color:#ef4444">✗ ${msg}</span>`;
+  }
 };
 
 window.manualRefresh = async function() {
