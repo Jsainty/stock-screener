@@ -250,9 +250,9 @@ select:focus,input[type=text]:focus{border-color:#6366f1}
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const TD  = 'https://api.twelvedata.com';   // Twelve Data — prices & history (free tier, CORS ok)
 const FMP = 'https://financialmodelingprep.com/api/v3'; // FMP — fundamentals only (optional)
-const TD_BATCH_SIZE       = 8;        // TD free tier: 8 credits/min, 1 credit = 1 symbol
-const PRICE_REFRESH_MS    = 65_000;   // 65s between batches — 1 batch of 8 per minute
-const ANALYSIS_REFRESH_MS = 65_000;
+const TD_BATCH_SIZE       = 8;        // TD free tier: 8 credits/min
+const PRICE_REFRESH_MS    = 30_000;   // 30s when using proxy (no rate limit); 65s for TD
+const ANALYSIS_REFRESH_MS = 30_000;
 const FUND_CACHE_MS       = 600_000;
 const NEWS_CACHE_MS       = 300_000;
 // US symbols
@@ -298,8 +298,9 @@ const UK_INDICES = [
 // ─── STATE ────────────────────────────────────────────────────────────────────
 const state = {
   tab: 'overview',
-  tdApiKey:  localStorage.getItem('td_key')  || '',  // Twelve Data — prices (primary)
-  apiKey:    localStorage.getItem('fmp_key') || '',  // FMP — fundamentals (optional)
+  proxyUrl:  localStorage.getItem('proxy_url') || '', // Cloudflare Worker proxy (primary — unlimited)
+  tdApiKey:  localStorage.getItem('td_key')    || '', // Twelve Data fallback (rate-limited)
+  apiKey:    localStorage.getItem('fmp_key')   || '', // FMP — fundamentals (optional)
   watchlist: JSON.parse(localStorage.getItem('watchlist') || '["AAPL","MSFT","NVDA","TSLA"]'),
   screenerData: [],
   marketData: [],
@@ -317,7 +318,7 @@ const state = {
   analysisTimer: null,
   clockTimer: null,
   lastRefresh: null,
-  priceBatchIndex: 0,   // which batch of 8 symbols to fetch next
+  priceBatchIndex: 0,
   // fundamentals cache: { [symbol]: { data, ts } }
   fundCache: {},
   // news cache: { [key]: { data, ts } }
@@ -977,48 +978,76 @@ function stockNewsHTML(articles) {
 
 // ─── SETTINGS ─────────────────────────────────────────────────────────────────
 function renderSettings(main) {
-  const hasTD  = !!state.tdApiKey;
-  const hasFMP = !!state.apiKey;
+  const hasProxy = !!state.proxyUrl;
+  const hasTD    = !!state.tdApiKey;
+  const hasFMP   = !!state.apiKey;
   main.innerHTML=`
     <h2 style="font-size:18px;font-weight:700;margin-bottom:16px">Settings</h2>
 
-    <!-- PRIMARY: Twelve Data -->
-    <div class="settings-section" style="border-color:${hasTD?'rgba(99,102,241,.4)':'#2d3148'}">
+    <!-- BEST OPTION: Cloudflare Worker proxy -->
+    <div class="settings-section" style="border-color:${hasProxy?'rgba(16,185,129,.5)':'rgba(99,102,241,.3)'}">
       <h3 style="display:flex;align-items:center;gap:8px">
-        <span style="background:#6366f1;color:white;font-size:10px;padding:2px 7px;border-radius:20px;font-weight:700">STEP 1 — REQUIRED</span>
-        Twelve Data API Key <span style="font-size:12px;color:#64748b;font-weight:400">(live prices)</span>
+        <span style="background:#10b981;color:white;font-size:10px;padding:2px 7px;border-radius:20px;font-weight:700">RECOMMENDED — FREE</span>
+        Cloudflare Worker Proxy
+        <span style="font-size:12px;color:#64748b;font-weight:400">unlimited · all stocks · 30s refresh</span>
       </h3>
       <div class="field">
-        <input type="text" id="tdKeyInput" value="${state.tdApiKey}" placeholder="Paste your Twelve Data key here…" style="width:100%"/>
-        <div class="field-note" style="margin-top:6px">
-          ✅ Works from browser &nbsp;|&nbsp; 800 free requests/day &nbsp;|&nbsp; US + UK stocks<br>
-          <strong style="color:#94a3b8">Get your free key:</strong>
-          Go to <strong style="color:#818cf8">twelvedata.com</strong> → Sign Up → copy key from dashboard
+        <input type="text" id="proxyInput" value="${state.proxyUrl}" placeholder="https://your-worker.workers.dev" style="width:100%"/>
+        <div class="field-note" style="margin-top:6px;line-height:1.8">
+          <strong style="color:#10b981">✓ No rate limits &nbsp; ✓ All 65+ US + UK stocks &nbsp; ✓ Refreshes every 30s &nbsp; ✓ Completely free</strong><br>
+          <strong style="color:#94a3b8">Setup (3 minutes, free):</strong><br>
+          1. Go to <strong style="color:#818cf8">workers.cloudflare.com</strong> → sign up free<br>
+          2. Click <strong>Create a Worker</strong><br>
+          3. Delete the example code, paste the contents of the <strong>worker.js</strong> file (in your project folder)<br>
+          4. Click <strong>Save and Deploy</strong> → copy the URL it gives you<br>
+          5. Paste that URL above and click <strong>Save Proxy URL</strong>
         </div>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
-        <button class="btn btn-primary" onclick="saveTdKey()">Save & Load Prices</button>
-        <button class="btn btn-ghost" onclick="testTdKey()">Test Key First</button>
+        <button class="btn btn-primary" style="background:#10b981" onclick="saveProxyUrl()">Save Proxy URL</button>
+        <button class="btn btn-ghost" onclick="testProxyUrl()">Test Connection</button>
       </div>
-      <div id="tdKeyStatus" style="font-size:13px">
-        ${hasTD
-          ? '<span style="color:#10b981">✓ Twelve Data key active — live prices enabled</span>'
-          : '<span style="color:#f59e0b">⚠ No key yet — showing demo data</span>'}
+      <div id="proxyStatus" style="font-size:13px">
+        ${hasProxy
+          ? '<span style="color:#10b981">✓ Proxy active — unlimited live data enabled</span>'
+          : '<span style="color:#64748b">No proxy yet — follow the 5 steps above</span>'}
       </div>
     </div>
 
-    <!-- OPTIONAL: FMP for fundamentals -->
+    <!-- FALLBACK: Twelve Data (rate-limited) -->
     <div class="settings-section">
       <h3 style="display:flex;align-items:center;gap:8px">
-        <span style="background:#475569;color:white;font-size:10px;padding:2px 7px;border-radius:20px;font-weight:700">STEP 2 — OPTIONAL</span>
-        Financial Modeling Prep Key <span style="font-size:12px;color:#64748b;font-weight:400">(deeper fundamentals)</span>
+        <span style="background:#475569;color:white;font-size:10px;padding:2px 7px;border-radius:20px;font-weight:700">FALLBACK</span>
+        Twelve Data API Key
+        <span style="font-size:12px;color:#64748b;font-weight:400">rate-limited · 8 stocks/min</span>
       </h3>
       <div class="field">
-        <input type="text" id="apiKeyInput" value="${state.apiKey}" placeholder="Paste your FMP key here (optional)…" style="width:100%"/>
+        <input type="text" id="tdKeyInput" value="${state.tdApiKey}" placeholder="Paste Twelve Data key (optional fallback)…" style="width:100%"/>
         <div class="field-note" style="margin-top:6px">
-          Adds: P/B ratio, margins, ROE, debt ratios, earnings growth when you click Analyse on a stock.<br>
-          Get free key at <strong style="color:#818cf8">financialmodelingprep.com</strong> — 250 requests/day.<br>
-          <em style="color:#ef4444">Note: FMP free tier may return HTTP 403 from some locations — Twelve Data above is the reliable option.</em>
+          Only use if you can't set up the proxy. Loads 8 stocks at a time due to API limits.
+          Free key at <strong style="color:#818cf8">twelvedata.com</strong> — 800 credits/day (1 credit per symbol).
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+        <button class="btn btn-ghost" onclick="saveTdKey()">Save TD Key</button>
+        <button class="btn btn-ghost" onclick="testTdKey()">Test TD Key</button>
+      </div>
+      <div id="tdKeyStatus" style="font-size:13px;color:#64748b">
+        ${hasTD ? '<span style="color:#10b981">✓ TD key saved</span>' : 'No TD key'}
+      </div>
+    </div>
+
+    <!-- OPTIONAL: FMP fundamentals -->
+    <div class="settings-section">
+      <h3 style="display:flex;align-items:center;gap:8px">
+        <span style="background:#475569;color:white;font-size:10px;padding:2px 7px;border-radius:20px;font-weight:700">OPTIONAL</span>
+        FMP Key <span style="font-size:12px;color:#64748b;font-weight:400">(P/B, margins, ROE, debt ratios)</span>
+      </h3>
+      <div class="field">
+        <input type="text" id="apiKeyInput" value="${state.apiKey}" placeholder="FMP key (optional)…" style="width:100%"/>
+        <div class="field-note" style="margin-top:6px">
+          Adds deeper fundamentals on the Analysis page. Free key at <strong style="color:#818cf8">financialmodelingprep.com</strong>.
+          Note: FMP free tier returns 403 from some locations.
         </div>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
@@ -1026,7 +1055,7 @@ function renderSettings(main) {
         <button class="btn btn-ghost" onclick="testApiKey()">Test FMP Key</button>
       </div>
       <div id="fmpKeyStatus" style="font-size:13px;color:#64748b">
-        ${hasFMP ? '<span style="color:#10b981">✓ FMP key saved</span>' : 'No FMP key — fundamentals will show N/A until added'}
+        ${hasFMP ? '<span style="color:#10b981">✓ FMP key saved</span>' : 'No FMP key'}
       </div>
     </div>
 
@@ -1344,6 +1373,70 @@ async function fetchTDHistory(sym, days) {
   } catch(e) { console.warn('TD history failed:', e.message); return null; }
 }
 
+// ─── CLOUDFLARE WORKER PROXY — UNLIMITED, NO KEY NEEDED ─────────────────────
+// Worker proxies Yahoo Finance; returns real-time data for all US + UK stocks.
+// See worker.js for deployment instructions (free, 3 minutes to set up).
+
+async function proxyFetch(path) {
+  const base = state.proxyUrl.replace(/\/$/, '');
+  const r = await fetch(`${base}${path}`);
+  if (!r.ok) throw new Error(`Proxy HTTP ${r.status}`);
+  const json = await r.json();
+  if (json?.error) throw new Error(json.error);
+  return json;
+}
+
+// Parse Yahoo Finance quoteResponse into our standard stock format
+function parseYahooQuotes(data) {
+  const results = data?.quoteResponse?.result || [];
+  return results.map(q => ({
+    symbol:            q.symbol,
+    name:              q.shortName || q.longName || q.symbol,
+    price:             q.regularMarketPrice     ?? null,
+    change:            q.regularMarketChange    ?? null,
+    changesPercentage: q.regularMarketChangePercent ?? null,
+    volume:            q.regularMarketVolume    ?? null,
+    marketCap:         q.marketCap              ?? null,
+    pe:                q.trailingPE             ?? null,
+    eps:               q.epsTrailingTwelveMonths ?? null,
+    yearHigh:          q.fiftyTwoWeekHigh       ?? null,
+    yearLow:           q.fiftyTwoWeekLow        ?? null,
+    exchange:          q.fullExchangeName || q.exchange || null,
+    sector:            q.sector                 || null,
+    industry:          q.industry               || null,
+    beta:              q.beta                   ?? null,
+    // Yahoo dividendYield is already a ratio like 0.0044 (0.44%)
+    dividendYield:     q.trailingAnnualDividendYield != null ? q.trailingAnnualDividendYield * 100 : null,
+    pb:                q.priceToBook            ?? null,
+  }));
+}
+
+async function fetchProxyQuotes(symbols) {
+  const syms = symbols.join(',');
+  const data = await proxyFetch(`?type=quote&symbols=${encodeURIComponent(syms)}`);
+  return parseYahooQuotes(data);
+}
+
+async function fetchProxyHistory(sym, days) {
+  const range = days <= 30 ? '1mo' : days <= 90 ? '3mo' : days <= 180 ? '6mo' : '1y';
+  const data  = await proxyFetch(`?type=history&symbol=${encodeURIComponent(sym)}&range=${range}`);
+  const result = data?.chart?.result?.[0];
+  if (!result) return null;
+  const timestamps = result.timestamp || [];
+  const closes     = result.indicators?.quote?.[0]?.close || [];
+  return timestamps
+    .map((ts, i) => ({ date: new Date(ts * 1000).toISOString().slice(0, 10), close: closes[i] }))
+    .filter(d => d.close != null);
+}
+
+async function validateProxy() {
+  try {
+    const data = await proxyFetch('?type=quote&symbols=AAPL');
+    const quotes = parseYahooQuotes(data);
+    return quotes.length > 0 ? { ok: true } : { ok: false, message: 'No data returned — check proxy URL' };
+  } catch(e) { return { ok: false, message: e.message }; }
+}
+
 // ─── FMP — FUNDAMENTALS ONLY (optional, free tier may 403) ──────────────────
 async function apiFetch(path) {
   const url = `${FMP}${path}${path.includes('?')?'&':'?'}apikey=${state.apiKey}`;
@@ -1481,8 +1574,8 @@ async function fetchFundamentals(sym) {
 }
 
 async function fetchLiveHistory(sym, days) {
-  // Prefer Twelve Data (works from browser); fall back to FMP if no TD key
-  if (state.tdApiKey) return fetchTDHistory(sym, days);
+  if (state.proxyUrl) return fetchProxyHistory(sym, days);  // unlimited, best option
+  if (state.tdApiKey) return fetchTDHistory(sym, days);     // rate-limited fallback
   if (!state.apiKey)  return null;
   try {
     const from = new Date(Date.now() - days * 86400000).toISOString().slice(0,10);
@@ -1572,10 +1665,10 @@ function updateMarketStatus() {
 // ─── AUTO-REFRESH ENGINE ──────────────────────────────────────────────────────
 function startPriceRefresh() {
   stopPriceRefresh();
-  if (!state.tdApiKey) return;
-  // Don't fire immediately — loadLiveMarketData already fetched batch 0
-  // Start at batch 1, fire every 65s (= 8 credits/65s = well within 8/min limit)
-  state.priceTimer = setInterval(refreshAllPrices, PRICE_REFRESH_MS);
+  if (!state.proxyUrl && !state.tdApiKey) return;
+  // Proxy: 30s refresh for all stocks. TD: 65s for rate-limited batches.
+  const interval = state.proxyUrl ? 30_000 : 65_000;
+  state.priceTimer = setInterval(refreshAllPrices, interval);
 }
 
 function stopPriceRefresh() {
@@ -1613,39 +1706,47 @@ function applyQuotePatch(existing, q) {
   };
 }
 
-// Single timer handler — smartly uses the 1 allowed request per 65s
-// On analysis tab: refresh that specific stock (most important to user)
-// On any other tab: rotate through all symbols 8 at a time
 async function refreshAllPrices() {
-  if (!state.tdApiKey) return;
+  if (!state.proxyUrl && !state.tdApiKey) return;
   try {
-    if (state.tab === 'analysis' && state.selectedSymbol) {
-      // Refresh only the open stock — 1 credit, fast price update
-      const data   = await tdFetch(`/quote?symbol=${toTDSym(state.selectedSymbol)}&dp=2`);
-      const quotes = parseTDQuotes(data);
-      const q      = quotes[0];
-      if (q && state.selectedStock) {
-        const prev      = state.selectedStock.price;
-        state.selectedStock = applyQuotePatch(state.selectedStock, q);
-        patchAnalysisPriceHeader(q, prev);
+    if (state.proxyUrl) {
+      // ── PROXY: refresh ALL symbols at once, every 30s, no limits ──
+      const symbols = state.tab === 'analysis' && state.selectedSymbol
+        ? [state.selectedSymbol]   // on analysis page, only refresh that stock
+        : ALL_SYMBOLS;             // otherwise refresh everything
+      const quotes = await fetchProxyQuotes(symbols);
+      applyBatchToState(quotes);
+      if (state.tab === 'analysis' && state.selectedStock && quotes[0]) {
+        patchAnalysisPriceHeader(quotes[0], state.selectedStock.price);
       }
     } else {
-      // Rotate through all symbols 8 at a time — 8 credits, covers full list over time
-      const ordered = buildPrioritySymbols();
-      const batches = chunkArray(ordered, TD_BATCH_SIZE);
-      const idx     = state.priceBatchIndex % batches.length;
-      state.priceBatchIndex++;
-      const tdSyms  = batches[idx].map(toTDSym).join(',');
-      const data    = await tdFetch(`/quote?symbol=${tdSyms}&dp=2`);
-      const quotes  = parseTDQuotes(data);
-      applyBatchToState(quotes);
-      const done = Math.min((idx + 1) * TD_BATCH_SIZE, ordered.length);
-      const lu = document.getElementById('lastUpdated');
-      if (lu) lu.textContent = `Live: ${done}/${ordered.length} stocks · refreshing every 65s`;
+      // ── TD: rotate 8 symbols per 65s ──
+      if (state.tab === 'analysis' && state.selectedSymbol) {
+        const data   = await tdFetch(`/quote?symbol=${toTDSym(state.selectedSymbol)}&dp=2`);
+        const quotes = parseTDQuotes(data);
+        const q      = quotes[0];
+        if (q && state.selectedStock) {
+          const prev = state.selectedStock.price;
+          state.selectedStock = applyQuotePatch(state.selectedStock, q);
+          patchAnalysisPriceHeader(q, prev);
+        }
+      } else {
+        const ordered = buildPrioritySymbols();
+        const batches = chunkArray(ordered, TD_BATCH_SIZE);
+        const idx     = state.priceBatchIndex % batches.length;
+        state.priceBatchIndex++;
+        const data    = await tdFetch(`/quote?symbol=${batches[idx].map(toTDSym).join(',')}&dp=2`);
+        const quotes  = parseTDQuotes(data);
+        applyBatchToState(quotes);
+        const done = Math.min((idx + 1) * TD_BATCH_SIZE, ordered.length);
+        const lu = document.getElementById('lastUpdated');
+        if (lu) lu.textContent = `Live: ${done}/${ordered.length} stocks · 65s cycle`;
+      }
     }
     state.lastRefresh = Date.now();
+    updateLastUpdatedText();
   } catch(e) {
-    if (e.message?.includes('429')) showToast('Rate limit — will resume automatically in 65s', 'info');
+    if (e.message?.includes('429')) showToast('Rate limit — resuming in 65s', 'info');
     console.warn('Price refresh failed:', e.message);
   }
 }
@@ -1818,16 +1919,17 @@ window.analyzeStock = async function(sym) {
   setTab('analysis');
 
   let quote = null, fundamentals = {};
-  const hasLive = state.tdApiKey || state.apiKey;
+  const hasLive = state.proxyUrl || state.tdApiKey || state.apiKey;
 
   if (hasLive) {
     showToast(`Fetching live data for ${sym}…`, 'info');
-    // Quote from Twelve Data (primary); fundamentals from FMP (optional)
-    const quotePromise = state.tdApiKey
-      ? fetchBatchQuotes([sym])
-      : Promise.resolve([]);
+    const quotePromise = state.proxyUrl
+      ? fetchProxyQuotes([sym])            // proxy: best quality, includes sector/pe/beta
+      : state.tdApiKey
+        ? fetchBatchQuotes([sym])          // TD fallback
+        : Promise.resolve([]);
     const fundPromise = state.apiKey
-      ? fetchFundamentals(sym)
+      ? fetchFundamentals(sym)             // FMP: deeper ratios (margins, ROE, D/E etc.)
       : Promise.resolve({});
     const [quotes, funds] = await Promise.all([quotePromise, fundPromise]);
     quote = quotes[0] || null;
@@ -1986,51 +2088,113 @@ function applyBatchToState(quotes) {
 }
 
 async function loadLiveMarketData(showToasts = false) {
-  if (!state.tdApiKey) {
-    if (showToasts) showToast('Add a Twelve Data key in Settings', 'info');
+  const hasProxy = !!state.proxyUrl;
+  const hasTD    = !!state.tdApiKey;
+
+  if (!hasProxy && !hasTD) {
+    if (showToasts) showToast('Add a Proxy URL or Twelve Data key in Settings', 'info');
     return false;
   }
 
-  // Seed market data from mock so the UI shows something immediately
+  // Always seed mock data first so UI is never blank
   if (!state.marketData.length) {
     state.marketData   = ALL_SYMBOLS.map(s => { const d=mockStock(s); const {scores}=score(d); return {...d,scores}; });
     state.screenerData = [...state.marketData];
   }
 
-  if (showToasts) showToast('Fetching first 8 prices…', 'info');
-
-  // Fetch ONLY the first batch of 8 — this is the validation AND initial data in one call
-  const ordered = buildPrioritySymbols();
-  const firstBatch = ordered.slice(0, TD_BATCH_SIZE);
-  try {
-    const tdSyms = firstBatch.map(toTDSym).join(',');
-    const data   = await tdFetch(`/quote?symbol=${tdSyms}&dp=2`);
-    const quotes = parseTDQuotes(data);
-
-    if (!quotes.length) {
-      if (showToasts) showToast('No data returned — check your API key', 'error');
+  if (hasProxy) {
+    // ── PROXY PATH: fetch ALL symbols at once, no rate limit ──
+    if (showToasts) showToast('Connecting to proxy…', 'info');
+    const validation = await validateProxy();
+    if (!validation.ok) {
+      if (showToasts) showToast(`Proxy error: ${validation.message}`, 'error');
       return false;
     }
-
-    applyBatchToState(quotes);
-    state.priceBatchIndex = 1; // next rotation starts at batch 1
-
-    const total  = ALL_SYMBOLS.length;
-    const loaded = quotes.length;
-    if (showToasts) showToast(
-      loaded === TD_BATCH_SIZE
-        ? `${loaded}/${total} stocks live ✓ — loading rest every 65s`
-        : `Partial load (${loaded} stocks) — more in 65s`,
-      'success'
-    );
-    return true;
-  } catch(e) {
-    const msg = e.message || 'Unknown error';
-    if (showToasts) showToast(`API error: ${msg}`, 'error');
-    console.error('loadLiveMarketData failed:', msg);
-    return false;
+    if (showToasts) showToast(`Loading all ${ALL_SYMBOLS.length} stocks…`, 'info');
+    try {
+      const quotes  = await fetchProxyQuotes(ALL_SYMBOLS);
+      if (!quotes.length) { if (showToasts) showToast('No quotes returned', 'error'); return false; }
+      // Build rich entries using Yahoo data (includes sector, pe, marketCap etc.)
+      const qMap = {};
+      quotes.forEach(q => { if (q.symbol) qMap[q.symbol] = q; });
+      state.marketData = ALL_SYMBOLS.map(sym => {
+        const q    = qMap[sym];
+        const mock = mockStock(sym); // fallback for any symbols Yahoo didn't return
+        if (!q) { const {scores} = score(mock); return {...mock, scores}; }
+        const entry = {
+          ...quoteToMarketEntry(q),
+          sector:        q.sector        || mock.sector,
+          industry:      q.industry      || null,
+          beta:          q.beta          ?? null,
+          dividendYield: q.dividendYield ?? null,
+          pb:            q.pb            ?? null,
+          description:   mock.description,  // Yahoo doesn't return description in quote
+          _livePrice: true,
+        };
+        const {scores} = score(entry);
+        entry.scores = scores;
+        return entry;
+      });
+      state.screenerData = [...state.marketData];
+      state.lastRefresh  = Date.now();
+      if (showToasts) showToast(`✓ All ${quotes.length} stocks loaded live`, 'success');
+      return true;
+    } catch(e) {
+      if (showToasts) showToast(`Proxy fetch failed: ${e.message}`, 'error');
+      return false;
+    }
+  } else {
+    // ── TD PATH: first batch of 8 only, rotate via timer ──
+    if (showToasts) showToast('Fetching first 8 prices…', 'info');
+    const ordered    = buildPrioritySymbols();
+    const firstBatch = ordered.slice(0, TD_BATCH_SIZE);
+    try {
+      const tdSyms = firstBatch.map(toTDSym).join(',');
+      const data   = await tdFetch(`/quote?symbol=${tdSyms}&dp=2`);
+      const quotes = parseTDQuotes(data);
+      if (!quotes.length) { if (showToasts) showToast('No data — check your Twelve Data key', 'error'); return false; }
+      applyBatchToState(quotes);
+      state.priceBatchIndex = 1;
+      if (showToasts) showToast(`${quotes.length}/${ALL_SYMBOLS.length} stocks live — rest load every 65s`, 'success');
+      return true;
+    } catch(e) {
+      if (showToasts) showToast(`Twelve Data error: ${e.message}`, 'error');
+      return false;
+    }
   }
 }
+
+// Save Cloudflare proxy URL
+window.saveProxyUrl = async function() {
+  state.proxyUrl = (document.getElementById('proxyInput')?.value || '').trim().replace(/\/$/, '');
+  localStorage.setItem('proxy_url', state.proxyUrl);
+  state.fundCache = {}; state.newsCache = {}; state._newsCached = null;
+  updateDataModeLabel();
+  if (state.proxyUrl) {
+    const ok = await loadLiveMarketData(true);
+    if (ok) startPriceRefresh();
+  } else {
+    stopPriceRefresh();
+  }
+  render(); updateLastUpdatedText(); updateMarketStatus();
+};
+
+window.testProxyUrl = async function() {
+  const url = (document.getElementById('proxyInput')?.value || '').trim();
+  if (!url) { showToast('Paste your worker URL first', 'info'); return; }
+  const prev = state.proxyUrl; state.proxyUrl = url;
+  const statusEl = document.getElementById('proxyStatus');
+  if (statusEl) statusEl.innerHTML = '<span style="color:#6366f1">⏳ Testing connection…</span>';
+  const res = await validateProxy();
+  state.proxyUrl = prev;
+  if (res.ok) {
+    showToast('✓ Proxy working — click Save Proxy URL', 'success');
+    if (statusEl) statusEl.innerHTML = '<span style="color:#10b981">✓ Connection successful — click Save Proxy URL</span>';
+  } else {
+    showToast(`✗ Proxy error: ${res.message}`, 'error');
+    if (statusEl) statusEl.innerHTML = `<span style="color:#ef4444">✗ ${res.message}</span>`;
+  }
+};
 
 // Save Twelve Data key (prices)
 window.saveTdKey = async function() {
@@ -2161,9 +2325,10 @@ function showToast(msg, type='info') {
 function updateDataModeLabel() {
   const el = document.getElementById('dataMode');
   if (!el) return;
-  if (state.tdApiKey)  el.textContent = '● Live (Twelve Data)';
-  else if (state.apiKey) el.textContent = '○ FMP only (no prices)';
-  else el.textContent = '○ Demo data';
+  if (state.proxyUrl)       el.textContent = '● Live · Yahoo Finance (proxy)';
+  else if (state.tdApiKey)  el.textContent = '◑ Live · Twelve Data (batched)';
+  else if (state.apiKey)    el.textContent = '○ FMP only';
+  else                      el.textContent = '○ Demo data';
 }
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
@@ -2171,7 +2336,7 @@ updateDataModeLabel();
 updateMarketStatus();
 startClock();
 
-if (state.tdApiKey) {
+if (state.proxyUrl || state.tdApiKey) {
   (async () => {
     await loadLiveMarketData(false);
     render();
