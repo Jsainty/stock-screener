@@ -248,11 +248,12 @@ select:focus,input[type=text]:focus{border-color:#6366f1}
 
 <script>
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
-const FMP = 'https://financialmodelingprep.com/api/v3';
-const PRICE_REFRESH_MS    = 60_000;   // refresh all prices every 60 s
-const ANALYSIS_REFRESH_MS = 30_000;   // refresh open stock quote every 30 s
-const FUND_CACHE_MS       = 600_000;  // cache fundamentals for 10 min
-const NEWS_CACHE_MS       = 300_000;  // cache news for 5 min
+const TD  = 'https://api.twelvedata.com';   // Twelve Data — prices & history (free tier, CORS ok)
+const FMP = 'https://financialmodelingprep.com/api/v3'; // FMP — fundamentals only (optional)
+const PRICE_REFRESH_MS    = 60_000;
+const ANALYSIS_REFRESH_MS = 30_000;
+const FUND_CACHE_MS       = 600_000;
+const NEWS_CACHE_MS       = 300_000;
 // US symbols
 const US_SYMBOLS = ['AAPL','MSFT','GOOGL','AMZN','NVDA','META','TSLA','BRK-B','JPM','JNJ',
   'V','PG','UNH','MA','HD','CVX','MRK','ABBV','PEP','KO',
@@ -296,7 +297,8 @@ const UK_INDICES = [
 // ─── STATE ────────────────────────────────────────────────────────────────────
 const state = {
   tab: 'overview',
-  apiKey: localStorage.getItem('fmp_key') || '',
+  tdApiKey:  localStorage.getItem('td_key')  || '',  // Twelve Data — prices (primary)
+  apiKey:    localStorage.getItem('fmp_key') || '',  // FMP — fundamentals (optional)
   watchlist: JSON.parse(localStorage.getItem('watchlist') || '["AAPL","MSFT","NVDA","TSLA"]'),
   screenerData: [],
   marketData: [],
@@ -973,30 +975,56 @@ function stockNewsHTML(articles) {
 
 // ─── SETTINGS ─────────────────────────────────────────────────────────────────
 function renderSettings(main) {
-  const hasKey=!!state.apiKey;
+  const hasTD  = !!state.tdApiKey;
+  const hasFMP = !!state.apiKey;
   main.innerHTML=`
     <h2 style="font-size:18px;font-weight:700;margin-bottom:16px">Settings</h2>
-    <div class="settings-section">
-      <h3>API Configuration</h3>
+
+    <!-- PRIMARY: Twelve Data -->
+    <div class="settings-section" style="border-color:${hasTD?'rgba(99,102,241,.4)':'#2d3148'}">
+      <h3 style="display:flex;align-items:center;gap:8px">
+        <span style="background:#6366f1;color:white;font-size:10px;padding:2px 7px;border-radius:20px;font-weight:700">STEP 1 — REQUIRED</span>
+        Twelve Data API Key <span style="font-size:12px;color:#64748b;font-weight:400">(live prices)</span>
+      </h3>
       <div class="field">
-        <label>Financial Modeling Prep API Key</label>
-        <input type="text" id="apiKeyInput" value="${state.apiKey}" placeholder="Paste your free API key…"/>
-        <div class="field-note">Get a free key at <strong>financialmodelingprep.com</strong> (250 requests/day). Without a key, realistic demo data is used.</div>
+        <input type="text" id="tdKeyInput" value="${state.tdApiKey}" placeholder="Paste your Twelve Data key here…" style="width:100%"/>
+        <div class="field-note" style="margin-top:6px">
+          ✅ Works from browser &nbsp;|&nbsp; 800 free requests/day &nbsp;|&nbsp; US + UK stocks<br>
+          <strong style="color:#94a3b8">Get your free key:</strong>
+          Go to <strong style="color:#818cf8">twelvedata.com</strong> → Sign Up → copy key from dashboard
+        </div>
       </div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
-        <button class="btn btn-primary" onclick="saveApiKey()">Save & Load Data</button>
-        <button class="btn btn-ghost" onclick="testApiKey()">Test Key</button>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+        <button class="btn btn-primary" onclick="saveTdKey()">Save & Load Prices</button>
+        <button class="btn btn-ghost" onclick="testTdKey()">Test Key First</button>
       </div>
-      <div id="apiKeyStatus" style="font-size:13px">
-        <span class="status-dot" style="background:${hasKey?'#10b981':'#f59e0b'}"></span>
-        ${hasKey?'<span style="color:#10b981">API key saved — live data active</span>':'<span style="color:#f59e0b">No API key — using demo data</span>'}
+      <div id="tdKeyStatus" style="font-size:13px">
+        ${hasTD
+          ? '<span style="color:#10b981">✓ Twelve Data key active — live prices enabled</span>'
+          : '<span style="color:#f59e0b">⚠ No key yet — showing demo data</span>'}
       </div>
-      <div style="margin-top:12px;font-size:12px;color:#64748b;line-height:1.6">
-        <strong style="color:#94a3b8">How to get a free key:</strong><br>
-        1. Go to <strong style="color:#818cf8">financialmodelingprep.com/register</strong><br>
-        2. Sign up and confirm your email<br>
-        3. Copy your key from the dashboard and paste it above<br>
-        4. Click <strong>Save & Load Data</strong>
+    </div>
+
+    <!-- OPTIONAL: FMP for fundamentals -->
+    <div class="settings-section">
+      <h3 style="display:flex;align-items:center;gap:8px">
+        <span style="background:#475569;color:white;font-size:10px;padding:2px 7px;border-radius:20px;font-weight:700">STEP 2 — OPTIONAL</span>
+        Financial Modeling Prep Key <span style="font-size:12px;color:#64748b;font-weight:400">(deeper fundamentals)</span>
+      </h3>
+      <div class="field">
+        <input type="text" id="apiKeyInput" value="${state.apiKey}" placeholder="Paste your FMP key here (optional)…" style="width:100%"/>
+        <div class="field-note" style="margin-top:6px">
+          Adds: P/B ratio, margins, ROE, debt ratios, earnings growth when you click Analyse on a stock.<br>
+          Get free key at <strong style="color:#818cf8">financialmodelingprep.com</strong> — 250 requests/day.<br>
+          <em style="color:#ef4444">Note: FMP free tier may return HTTP 403 from some locations — Twelve Data above is the reliable option.</em>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+        <button class="btn btn-ghost" onclick="saveApiKey()">Save FMP Key</button>
+        <button class="btn btn-ghost" onclick="testApiKey()">Test FMP Key</button>
+      </div>
+      <div id="fmpKeyStatus" style="font-size:13px;color:#64748b">
+        ${hasFMP ? '<span style="color:#10b981">✓ FMP key saved</span>' : 'No FMP key — fundamentals will show N/A until added'}
       </div>
     </div>
 
@@ -1230,48 +1258,99 @@ function timeAgo(dateStr) {
   return `${Math.floor(h/24)}d ago`;
 }
 
-// ─── LIVE API FETCHERS ────────────────────────────────────────────────────────
-async function apiFetch(path) {
-  const url = `${FMP}${path}${path.includes('?')?'&':'?'}apikey=${state.apiKey}`;
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  const json = await r.json();
-  // FMP returns errors as objects, not HTTP error codes
-  if (json && typeof json === 'object' && !Array.isArray(json)) {
-    const msg = json['Error Message'] || json.message || json.error;
-    if (msg) throw new Error(msg);
-  }
-  return json;
-}
-
-// Validate key with a single known symbol before doing bulk requests
-async function validateApiKey() {
-  try {
-    const data = await apiFetch('/quote/AAPL');
-    return { ok: true };
-  } catch(e) {
-    return { ok: false, message: e.message };
-  }
-}
-
-// Chunk symbols into groups so URLs stay short — FMP handles ~15-20 at a time reliably
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
 function chunkArray(arr, size) {
   const chunks = [];
   for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
   return chunks;
 }
 
-// Fetch quotes in chunks of 15, merge results
-async function fetchBatchQuotes(symbols) {
+// UK symbol conversion: SHEL.L ↔ SHEL:LSE  (Twelve Data uses :LSE, not .L)
+function toTDSym(sym)   { return isUK(sym) ? sym.replace('.L', ':LSE') : sym; }
+function fromTDSym(sym) { return sym.endsWith(':LSE') ? sym.replace(':LSE', '.L') : sym; }
+
+// ─── TWELVE DATA — PRIMARY PRICE SOURCE ──────────────────────────────────────
+async function tdFetch(path) {
+  const sep = path.includes('?') ? '&' : '?';
+  const url = `${TD}${path}${sep}apikey=${state.tdApiKey}`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const json = await r.json();
+  if (json?.status === 'error') throw new Error(json.message || 'Twelve Data error');
+  return json;
+}
+
+async function validateTdKey() {
   try {
-    const chunks = chunkArray(symbols, 15);
-    const results = await Promise.allSettled(
-      chunks.map(chunk => apiFetch(`/quote/${chunk.join(',')}`))
-    );
-    return results
-      .filter(r => r.status === 'fulfilled' && Array.isArray(r.value))
-      .flatMap(r => r.value);
-  } catch(e) { console.warn('Batch quote fetch failed:', e.message); return []; }
+    await tdFetch('/quote?symbol=AAPL');
+    return { ok: true };
+  } catch(e) { return { ok: false, message: e.message }; }
+}
+
+// Fetch quotes from Twelve Data in chunks of 20
+async function fetchBatchQuotes(symbols) {
+  if (!state.tdApiKey) return [];
+  const chunks = chunkArray(symbols, 20);
+  const out = [];
+  const results = await Promise.allSettled(
+    chunks.map(chunk => tdFetch(`/quote?symbol=${chunk.map(toTDSym).join(',')}&dp=2`))
+  );
+  for (const res of results) {
+    if (res.status !== 'fulfilled') continue;
+    const data = res.value;
+    // TD returns: single symbol → plain object; multiple → { SYM: {...}, SYM2: {...} }
+    const entries = (data?.symbol) ? [[toTDSym(data.symbol), data]] : Object.entries(data);
+    for (const [tdSym, q] of entries) {
+      if (!q || q.status === 'error' || !q.close) continue;
+      out.push({
+        symbol:           fromTDSym(tdSym),
+        name:             q.name || tdSym,
+        price:            parseFloat(q.close)   || 0,
+        change:           parseFloat(q.change)  || 0,
+        changesPercentage: parseFloat(q.percent_change) || 0,
+        volume:           parseInt(q.volume)    || 0,
+        marketCap:        null,   // not on TD free tier
+        pe:               null,   // not on TD free tier basic
+        eps:              null,
+        yearHigh:         q.fifty_two_week?.high ? parseFloat(q.fifty_two_week.high) : null,
+        yearLow:          q.fifty_two_week?.low  ? parseFloat(q.fifty_two_week.low)  : null,
+        exchange:         q.exchange || null,
+      });
+    }
+  }
+  return out;
+}
+
+async function fetchTDHistory(sym, days) {
+  try {
+    const data = await tdFetch(`/time_series?symbol=${toTDSym(sym)}&interval=1day&outputsize=${days}`);
+    if (!data?.values?.length) return null;
+    return [...data.values].reverse().map(v => ({
+      date:  v.datetime,
+      close: parseFloat(v.close),
+    }));
+  } catch(e) { console.warn('TD history failed:', e.message); return null; }
+}
+
+// ─── FMP — FUNDAMENTALS ONLY (optional, free tier may 403) ──────────────────
+async function apiFetch(path) {
+  const url = `${FMP}${path}${path.includes('?')?'&':'?'}apikey=${state.apiKey}`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const json = await r.json();
+  if (json && !Array.isArray(json)) {
+    const msg = json['Error Message'] || json.message || json.error;
+    if (msg) throw new Error(msg);
+  }
+  return json;
+}
+
+// Legacy — kept for FMP fundamentals fetch only
+async function validateApiKey() {
+  try {
+    await apiFetch('/quote/AAPL');
+    return { ok: true };
+  } catch(e) { return { ok: false, message: e.message }; }
 }
 
 // Build a clean stock entry from a live quote — NO mock fundamentals injected
@@ -1390,13 +1469,16 @@ async function fetchFundamentals(sym) {
 }
 
 async function fetchLiveHistory(sym, days) {
+  // Prefer Twelve Data (works from browser); fall back to FMP if no TD key
+  if (state.tdApiKey) return fetchTDHistory(sym, days);
+  if (!state.apiKey)  return null;
   try {
     const from = new Date(Date.now() - days * 86400000).toISOString().slice(0,10);
     const data = await apiFetch(`/historical-price-full/${sym}?from=${from}`);
     const hist = (data?.historical || []).reverse();
     if (!hist.length) throw new Error('empty');
     return hist.map(h => ({ date: h.date, close: h.close }));
-  } catch(e) { console.warn('History fetch failed:', e.message); return null; }
+  } catch(e) { console.warn('FMP history failed:', e.message); return null; }
 }
 
 // ─── NEWS FETCHERS ───────────────────────────────────────────────────────────
@@ -1730,16 +1812,20 @@ window.analyzeStock = async function(sym) {
   setTab('analysis');
 
   let quote = null, fundamentals = {};
+  const hasLive = state.tdApiKey || state.apiKey;
 
-  if (state.apiKey) {
+  if (hasLive) {
     showToast(`Fetching live data for ${sym}…`, 'info');
-    // Fetch quote + fundamentals in parallel
-    const [quotes, funds] = await Promise.all([
-      fetchBatchQuotes([sym]),
-      fetchFundamentals(sym),
-    ]);
+    // Quote from Twelve Data (primary); fundamentals from FMP (optional)
+    const quotePromise = state.tdApiKey
+      ? fetchBatchQuotes([sym])
+      : Promise.resolve([]);
+    const fundPromise = state.apiKey
+      ? fetchFundamentals(sym)
+      : Promise.resolve({});
+    const [quotes, funds] = await Promise.all([quotePromise, fundPromise]);
     quote = quotes[0] || null;
-    fundamentals = funds;
+    fundamentals = funds || {};
   }
 
   let d;
@@ -1870,18 +1956,21 @@ window.setChartRange = async function(days) {
 
 // Shared helper — build market data from live quotes + profiles, no mock fundamentals
 async function loadLiveMarketData(showToasts = false) {
-  if (showToasts) showToast('Validating API key…', 'info');
-
-  // Step 1: validate key with a single known symbol before bulk requests
-  const validation = await validateApiKey();
-  if (!validation.ok) {
-    const msg = validation.message || 'Unknown error';
-    if (showToasts) showToast(`API key error: ${msg}`, 'error');
-    console.error('FMP API key validation failed:', msg);
+  if (!state.tdApiKey) {
+    if (showToasts) showToast('Add a Twelve Data API key in Settings to load live data', 'info');
     return false;
   }
 
-  if (showToasts) showToast('Key valid — loading prices and profiles…', 'info');
+  if (showToasts) showToast('Validating Twelve Data key…', 'info');
+
+  const validation = await validateTdKey();
+  if (!validation.ok) {
+    const msg = validation.message || 'Unknown error';
+    if (showToasts) showToast(`Twelve Data error: ${msg}`, 'error');
+    return false;
+  }
+
+  if (showToasts) showToast('Key valid — loading live prices…', 'info');
 
   // Step 2: bulk load in chunks
   const [quotes, profiles] = await Promise.all([
@@ -1929,55 +2018,69 @@ async function loadLiveMarketData(showToasts = false) {
   return true;
 }
 
-window.saveApiKey = async function() {
-  state.apiKey = document.getElementById('apiKeyInput').value.trim();
-  localStorage.setItem('fmp_key', state.apiKey);
-  // Invalidate all caches when key changes
-  state.fundCache  = {};
-  state.newsCache  = {};
-  state._newsCached = null;
+// Save Twelve Data key (prices)
+window.saveTdKey = async function() {
+  state.tdApiKey = (document.getElementById('tdKeyInput')?.value || '').trim();
+  localStorage.setItem('td_key', state.tdApiKey);
+  state.fundCache = {}; state.newsCache = {}; state._newsCached = null;
   updateDataModeLabel();
-
-  if (state.apiKey) {
+  if (state.tdApiKey) {
     await loadLiveMarketData(true);
     startPriceRefresh();
   } else {
     stopPriceRefresh();
-    state.marketData  = [];
-    state.screenerData = [];
+    state.marketData = []; state.screenerData = [];
   }
+  render(); updateLastUpdatedText(); updateMarketStatus();
+};
 
+// Test Twelve Data key without saving
+window.testTdKey = async function() {
+  const key = (document.getElementById('tdKeyInput')?.value || '').trim();
+  if (!key) { showToast('Paste your Twelve Data key first', 'info'); return; }
+  const prev = state.tdApiKey; state.tdApiKey = key;
+  const statusEl = document.getElementById('tdKeyStatus');
+  if (statusEl) statusEl.innerHTML = '<span style="color:#6366f1">⏳ Testing…</span>';
+  const res = await validateTdKey();
+  state.tdApiKey = prev;
+  if (res.ok) {
+    showToast('✓ Key is valid — click Save & Load Prices', 'success');
+    if (statusEl) statusEl.innerHTML = '<span style="color:#10b981">✓ Valid — click Save & Load Prices</span>';
+  } else {
+    showToast(`✗ ${res.message}`, 'error');
+    if (statusEl) statusEl.innerHTML = `<span style="color:#ef4444">✗ ${res.message}</span>`;
+  }
+};
+
+// Save FMP key (optional — fundamentals only)
+window.saveApiKey = async function() {
+  state.apiKey = (document.getElementById('apiKeyInput')?.value || '').trim();
+  localStorage.setItem('fmp_key', state.apiKey);
+  state.fundCache = {};
+  updateDataModeLabel();
+  showToast(state.apiKey ? 'FMP key saved — used for full fundamental analysis' : 'FMP key cleared', 'info');
   render();
-  updateLastUpdatedText();
-  updateMarketStatus();
 };
 
 window.testApiKey = async function() {
-  const key = document.getElementById('apiKeyInput')?.value.trim();
-  if (!key) { showToast('Paste your API key first', 'info'); return; }
-
-  // Temporarily use the typed key (not yet saved) for the test
-  const prev = state.apiKey;
-  state.apiKey = key;
-
-  const statusEl = document.getElementById('apiKeyStatus');
-  if (statusEl) statusEl.innerHTML = '<span style="color:#6366f1">⏳ Testing key…</span>';
-
-  const result = await validateApiKey();
-  state.apiKey = prev; // restore — user hasn't saved yet
-
-  if (result.ok) {
-    showToast('✓ API key is valid — click Save & Load Data to activate', 'success');
-    if (statusEl) statusEl.innerHTML = '<span style="color:#10b981">✓ Key tested successfully — click Save & Load Data</span>';
+  const key = (document.getElementById('apiKeyInput')?.value || '').trim();
+  if (!key) { showToast('Paste your FMP key first', 'info'); return; }
+  const prev = state.apiKey; state.apiKey = key;
+  const statusEl = document.getElementById('fmpKeyStatus');
+  if (statusEl) statusEl.innerHTML = '<span style="color:#6366f1">⏳ Testing…</span>';
+  const res = await validateApiKey();
+  state.apiKey = prev;
+  if (res.ok) {
+    showToast('✓ FMP key valid', 'success');
+    if (statusEl) statusEl.innerHTML = '<span style="color:#10b981">✓ Valid</span>';
   } else {
-    const msg = result.message || 'Unknown error';
-    showToast(`✗ Key invalid: ${msg}`, 'error');
-    if (statusEl) statusEl.innerHTML = `<span style="color:#ef4444">✗ ${msg}</span>`;
+    showToast(`✗ FMP: ${res.message}`, 'error');
+    if (statusEl) statusEl.innerHTML = `<span style="color:#ef4444">✗ ${res.message}</span>`;
   }
 };
 
 window.manualRefresh = async function() {
-  if (!state.apiKey) { showToast('Add an API key in Settings first', 'info'); return; }
+  if (!state.tdApiKey) { showToast('Add a Twelve Data key in Settings', 'info'); return; }
   showToast('Refreshing prices…', 'info');
   await refreshAllPrices();
   if (state.tab === 'overview' || state.tab === 'screener') render();
@@ -2043,7 +2146,10 @@ function showToast(msg, type='info') {
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 function updateDataModeLabel() {
   const el = document.getElementById('dataMode');
-  if (el) el.textContent = state.apiKey ? '● Live data (FMP)' : '○ Demo data';
+  if (!el) return;
+  if (state.tdApiKey)  el.textContent = '● Live (Twelve Data)';
+  else if (state.apiKey) el.textContent = '○ FMP only (no prices)';
+  else el.textContent = '○ Demo data';
 }
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
@@ -2051,7 +2157,7 @@ updateDataModeLabel();
 updateMarketStatus();
 startClock();
 
-if (state.apiKey) {
+if (state.tdApiKey) {
   (async () => {
     await loadLiveMarketData(false);
     render();
