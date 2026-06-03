@@ -250,8 +250,8 @@ select:focus,input[type=text]:focus{border-color:#6366f1}
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const TD  = 'https://api.twelvedata.com';   // Twelve Data — prices & history (free tier, CORS ok)
 const FMP = 'https://financialmodelingprep.com/api/v3'; // FMP — fundamentals only (optional)
-const PRICE_REFRESH_MS    = 60_000;
-const ANALYSIS_REFRESH_MS = 30_000;
+const PRICE_REFRESH_MS    = 120_000;  // 2 min — keeps well under TD 8 req/min free limit
+const ANALYSIS_REFRESH_MS = 60_000;   // 1 min
 const FUND_CACHE_MS       = 600_000;
 const NEWS_CACHE_MS       = 300_000;
 // US symbols
@@ -1274,6 +1274,7 @@ async function tdFetch(path) {
   const sep = path.includes('?') ? '&' : '?';
   const url = `${TD}${path}${sep}apikey=${state.tdApiKey}`;
   const r = await fetch(url);
+  if (r.status === 429) throw new Error('Rate limit hit — wait 60s and try again (free tier: 8 req/min)');
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const json = await r.json();
   if (json?.status === 'error') throw new Error(json.message || 'Twelve Data error');
@@ -1288,37 +1289,46 @@ async function validateTdKey() {
 }
 
 // Fetch quotes from Twelve Data in chunks of 20
-async function fetchBatchQuotes(symbols) {
-  if (!state.tdApiKey) return [];
-  const chunks = chunkArray(symbols, 20);
+// ONE request for all symbols — TD supports up to 120 per call, counts as 1 against rate limit
+function parseTDQuotes(data) {
   const out = [];
-  const results = await Promise.allSettled(
-    chunks.map(chunk => tdFetch(`/quote?symbol=${chunk.map(toTDSym).join(',')}&dp=2`))
-  );
-  for (const res of results) {
-    if (res.status !== 'fulfilled') continue;
-    const data = res.value;
-    // TD returns: single symbol → plain object; multiple → { SYM: {...}, SYM2: {...} }
-    const entries = (data?.symbol) ? [[toTDSym(data.symbol), data]] : Object.entries(data);
-    for (const [tdSym, q] of entries) {
-      if (!q || q.status === 'error' || !q.close) continue;
-      out.push({
-        symbol:           fromTDSym(tdSym),
-        name:             q.name || tdSym,
-        price:            parseFloat(q.close)   || 0,
-        change:           parseFloat(q.change)  || 0,
-        changesPercentage: parseFloat(q.percent_change) || 0,
-        volume:           parseInt(q.volume)    || 0,
-        marketCap:        null,   // not on TD free tier
-        pe:               null,   // not on TD free tier basic
-        eps:              null,
-        yearHigh:         q.fifty_two_week?.high ? parseFloat(q.fifty_two_week.high) : null,
-        yearLow:          q.fifty_two_week?.low  ? parseFloat(q.fifty_two_week.low)  : null,
-        exchange:         q.exchange || null,
-      });
-    }
+  if (!data || typeof data !== 'object') return out;
+  // Single symbol → plain object with a `symbol` field; multiple → { SYM: {...}, ... }
+  const entries = data.symbol ? [[data.symbol, data]] : Object.entries(data);
+  for (const [tdSym, q] of entries) {
+    if (!q || q.status === 'error' || !q.close) continue;
+    out.push({
+      symbol:            fromTDSym(tdSym),
+      name:              q.name || tdSym,
+      price:             parseFloat(q.close)          || 0,
+      change:            parseFloat(q.change)         || 0,
+      changesPercentage: parseFloat(q.percent_change) || 0,
+      volume:            parseInt(q.volume)           || 0,
+      marketCap:         null,
+      pe:                null,
+      eps:               null,
+      yearHigh:  q.fifty_two_week?.high ? parseFloat(q.fifty_two_week.high) : null,
+      yearLow:   q.fifty_two_week?.low  ? parseFloat(q.fifty_two_week.low)  : null,
+      exchange:  q.exchange || null,
+    });
   }
   return out;
+}
+
+async function fetchBatchQuotes(symbols) {
+  if (!state.tdApiKey) return [];
+  try {
+    // All symbols in ONE request — 1 API call regardless of symbol count
+    const tdSyms = symbols.map(toTDSym).join(',');
+    const data = await tdFetch(`/quote?symbol=${tdSyms}&dp=2`);
+    return parseTDQuotes(data);
+  } catch(e) {
+    console.warn('TD batch quotes failed:', e.message);
+    if (e.message.includes('429') || e.message.includes('Rate limit')) {
+      showToast('⚠ Rate limit hit — prices will retry in 2 minutes', 'error');
+    }
+    return [];
+  }
 }
 
 async function fetchTDHistory(sym, days) {
@@ -1972,10 +1982,10 @@ async function loadLiveMarketData(showToasts = false) {
 
   if (showToasts) showToast('Key valid — loading live prices…', 'info');
 
-  // Step 2: bulk load in chunks
+  // Prices from TD (1 request), profiles from FMP only if key exists
   const [quotes, profiles] = await Promise.all([
     fetchBatchQuotes(ALL_SYMBOLS),
-    fetchBatchProfiles(ALL_SYMBOLS),
+    state.apiKey ? fetchBatchProfiles(ALL_SYMBOLS) : Promise.resolve({}),
   ]);
 
   if (!quotes.length) {
